@@ -1,0 +1,34 @@
+{
+  "name": "ava-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ava's contracts and the scripts that prove them on the QoreChain testnet.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "install:forge-std": "forge install --no-git --shallow foundry-rs/forge-std@v1.17.0",
+    "install:oz": "forge install --no-git --shallow OpenZeppelin/openzeppelin-contracts@v5.6.1",
+    "new-deployer": "tsx scripts/new-deployer.ts",
+    "register-deployer": "tsx scripts/register-deployer.ts",
+    "prove:m1": "forge build --quiet && tsx scripts/prove-m1.ts",
+    "deploy:registry": "forge build --quiet && tsx scripts/deploy-registry.ts",
+    "prove:registry": "forge build --quiet && tsx scripts/prove-registry.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ava/core": "file:../core",
+    "@cosmjs/stargate": "0.39.0",
+    "@qorechain/evm": "0.14.0",
+    "@qorechain/pqc": "0.2.3",
+    "@qorechain/qoreseal": "0.1.0",
+    "@qorechain/sdk": "0.14.0",
+    "viem": "2.57.20"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

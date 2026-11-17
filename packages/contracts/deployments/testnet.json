@@ -1,0 +1,18 @@
+{
+  "network": "qorechain-diana",
+  "evmChainId": 9800,
+  "PqcProbe": {
+    "address": "0x624b5C35E3665eB9ade6d75BBbca1218a09E00D1",
+    "deployTx": "0x9fd375c4c948296537ab4419683740f15f4fc71bd7dcaa5b6742d92c12c3d495",
+    "blockNumber": "10181860",
+    "deployer": "0x8A37d6f2DA1F8a07f1735c568C2611205d93e973"
+  },
+  "BoardRegistry": {
+    "address": "0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa",
+    "deployTx": "0xc2e8a6dd43ba9e144967ece917213a0e8cffbc47e0fe38b1e7cbf7b0e0f7eaa1",
+    "blockNumber": "10235963",
+    "deployer": "0x8A37d6f2DA1F8a07f1735c568C2611205d93e973",
+    "runtimeCodeHash": "0x157b97bfe8fdc2477a2326a26cee20683bf25ca44a96f98ee5c233745f844a9b",
+    "solcVersion": "0.8.38+commit.1835d247"
+  }
+}

@@ -1,0 +1,54 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+cache_path = "cache"
+# Pinned so every build, test and deploy uses the same compiler. Latest stable on 16 Nov 2026.
+solc_version = "0.8.38"
+auto_detect_solc = false
+# QoreChain runs Shanghai, Cancun and Prague; Osaka is not active, so newer opcodes must not be emitted.
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 200
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+]
+# solc 0.8.38 warns that `at` will become a keyword. OpenZeppelin 5.6.1 still names a function `at`
+# in this one file; we never call it, and our own files keep every warning.
+ignored_warnings_from = ["lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol"]
+# BoardRegistryVectors.t.sol reads the shared vectors packages/core writes. Read only, that one file.
+fs_permissions = [{ access = "read", path = "../core/test-vectors/actions.json" }]
+# Only our own contracts; the precompile mocks would otherwise crowd the report.
+gas_reports = ["BoardRegistry", "PqcProbe"]
+# The real-signature tests run Node through ffi, which stays off here. FOUNDRY_PROFILE=realsig runs them.
+no_match_path = "test/BoardRegistryRealSig.t.sol"
+
+[fuzz]
+runs = 1024
+
+[invariant]
+# One campaign checks all ten invariants after every call. At these numbers the whole default
+# suite takes about 40 seconds; keep it under two minutes. The long campaign is
+# FOUNDRY_PROFILE=deep forge test --match-path 'test/invariant/*'.
+runs = 256
+depth = 64
+# The handler catches every refused registry call itself, so a revert that reaches the fuzzer is a
+# bug in the handler, and it fails the run.
+fail_on_revert = true
+show_metrics = true
+
+[profile.deep.fuzz]
+runs = 10000
+
+[profile.deep.invariant]
+runs = 2000
+depth = 128
+
+[profile.realsig]
+# ffi lets a test run commands on this machine, so it is on only for the one file below.
+ffi = true
+match_path = "test/BoardRegistryRealSig.t.sol"
+# Replaces the default exclusion above; test/ffi holds only Node scripts, so this skips no test.
+no_match_path = "test/ffi/**"

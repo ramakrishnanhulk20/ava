@@ -1,0 +1,174 @@
+Ava BoardRegistry, live proof on the QoreChain testnet. Started 2026-11-17T05:29:13.760Z.
+relayer:  the deployer qor13gmaduk6r79q0utnt3tgcfs3ypwe86tn8292fq / 0x8A37d6f2DA1F8a07f1735c568C2611205d93e973, 2.792261 QOR. It sends every registry transaction and grants nothing.
+
+1. Chain and registry
+  check:    the consensus RPC serves qorechain-diana, the chain @ava/core seals for: yes
+  check:    eth_chainId is 9800, the chain id @ava/core signs into every message: yes
+  registry: 0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa, deployed in 0xc2e8a6dd43ba9e144967ece917213a0e8cffbc47e0fe38b1e7cbf7b0e0f7eaa1 at block 10235963
+  check:    the registry's runtime code hashes to 0x157b97bfe8fdc2477a2326a26cee20683bf25ca44a96f98ee5c233745f844a9b, the hash recorded at deploy: yes
+  check:    the current build's runtime code hashes the same, so this script speaks the deployed ABI: yes
+
+2. Identities: chair, Dana, Eli
+  check:    the deployer, the chair, Dana and Eli are four different accounts: yes
+  chair: qor1vju9cs38wmgh8geylfevcuhhll7agtvzx52h8m / 0x64B85C422776d173A324fa72CC72f7Fffdd42d82 (one 20-byte account on both lanes, coin type 60)
+  check:    chair: PQ key found over REST, this phrase's ML-DSA-87 key, possession_proven true: yes
+  check:    chair: pqcKeyStatus(0x64B85C422776d173A324fa72CC72f7Fffdd42d82), the precompile the registry reads, says registered, algorithm 1, possessionProven, 2,592-byte key equal to this phrase's: yes
+  check:    chair: KEM key found via qor_getKEMKey(0x64B85C422776d173A324fa72CC72f7Fffdd42d82): algorithm 2, 1,568 bytes, account matched as 20 bytes, this phrase's key: yes
+  dana: qor12f0uj0wumldqcyhkh548a5szmvvtrzfxa4t7y4 / 0x525fc93ddCDFDa0c12f6bd2A7eD202DB18B18926 (one 20-byte account on both lanes, coin type 60)
+  check:    dana: PQ key found over REST, this phrase's ML-DSA-87 key, possession_proven true: yes
+  check:    dana: pqcKeyStatus(0x525fc93ddCDFDa0c12f6bd2A7eD202DB18B18926), the precompile the registry reads, says registered, algorithm 1, possessionProven, 2,592-byte key equal to this phrase's: yes
+  check:    dana: KEM key found via qor_getKEMKey(0x525fc93ddCDFDa0c12f6bd2A7eD202DB18B18926): algorithm 2, 1,568 bytes, account matched as 20 bytes, this phrase's key: yes
+  eli: qor1dmk0fd9zkaqg6vunrksw3x6uwsayhhmgqt7dyg / 0x6EECF4b4A2B7408D33931DA0E89B5c743A4BDF68 (one 20-byte account on both lanes, coin type 60)
+  check:    eli: PQ key found over REST, this phrase's ML-DSA-87 key, possession_proven true: yes
+  check:    eli: pqcKeyStatus(0x6EECF4b4A2B7408D33931DA0E89B5c743A4BDF68), the precompile the registry reads, says registered, algorithm 1, possessionProven, 2,592-byte key equal to this phrase's: yes
+  check:    eli: KEM key found via qor_getKEMKey(0x6EECF4b4A2B7408D33931DA0E89B5c743A4BDF68): algorithm 2, 1,568 bytes, account matched as 20 bytes, this phrase's key: yes
+
+3. The chair creates a board (3a), and a second one for attack 7e (3b)
+  3a board: boardRef 0x6ea8d09dbda5ae25a299e619de7a657bb348d1771c9006a6d49df889de6a5603 from newBoardRef; a fresh epoch 0 key sealed to the chair only (1729-byte envelope, sha256 0x649fb791316e71bdb643c59013b22597a454740191fba48cc64e23c1ac80ffc4)
+  signed:   CREATE by the chair's ML-DSA-87 key over createNonce 12 read at block 10237380, deadline that block's time + 600 s
+  pre-flight: eth_call of the exact createBoard from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 110734 uqor from evmWindowCost; opened in DA5E364386AEE0DE043DC6C49F9DEBCD11FAE10C59E986F32F0F8CC2136ABBAC (fee 0.036799 QOR)
+  tx:       0xd7a24cd1a0472706c9fffa81811c3a438ccc601b245dea407f7eb05433c95e95, block 10237394, gas used 416878, fee 0.046899 QOR
+  events:   BoardCreated, EnvelopeGranted
+  getBoard(13): chair 0x64B85C422776d173A324fa72CC72f7Fffdd42d82, boardRef 0x6ea8d09dbda5ae25a299e619de7a657bb348d1771c9006a6d49df889de6a5603, epoch 0, nonce 0, members 1, documents 0
+  check:    board 13 holds the chair, this boardRef, epoch 0 and board nonce 0 (the next action signs nonce 0), with the chair its only member: yes
+  check:    the chair's createNonce moved from 12 to 13: yes
+  check:    getGrants(13, 0) is one MODE_ROTATE grant with this envelope's sha256 and size: yes
+  3b board: boardRef 0x789e36d5181dfd4c046093e26f0433b985e2e04636e2d68e34afd9e1a690a58f from newBoardRef; a fresh epoch 0 key sealed to the chair only (1729-byte envelope, sha256 0x08e199d952bce11aed29c443d9c3faceeb77199534d6f5af22253f2b4832fec5)
+  signed:   CREATE by the chair's ML-DSA-87 key over createNonce 13 read at block 10237395, deadline that block's time + 600 s
+  pre-flight: eth_call of the exact createBoard from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 110772 uqor from evmWindowCost; opened in B69A24A4A5F92AE19CFD319FE0C991BF574914E29FC313BD3B8D842724DE4FCF (fee 0.036799 QOR)
+  tx:       0x54b215b2e98592d6bf8e3f5b9f0fecca72258fb414a3105e6296b757edc1f5c3, block 10237409, gas used 417022, fee 0.046915 QOR
+  events:   BoardCreated, EnvelopeGranted
+  getBoard(14): chair 0x64B85C422776d173A324fa72CC72f7Fffdd42d82, boardRef 0x789e36d5181dfd4c046093e26f0433b985e2e04636e2d68e34afd9e1a690a58f, epoch 0, nonce 0, members 1, documents 0
+  check:    board 14 holds the chair, this boardRef, epoch 0 and board nonce 0 (the next action signs nonce 0), with the chair its only member: yes
+  check:    the chair's createNonce moved from 13 to 14: yes
+  check:    getGrants(14, 0) is one MODE_ROTATE grant with this envelope's sha256 and size: yes
+  board 14 exists only so attack 7e has a second board of the same chair
+
+4. The chair adds Dana (MODE_ROTATE), then Eli (MODE_SEAL_CURRENT)
+  4a Dana, MODE_ROTATE. Read at block 10237410: epoch 0, nonce 0, members 0x64B85C422776d173A324fa72CC72f7Fffdd42d82
+  sealed:   a fresh epoch 1 key to the chair and Dana (3361-byte envelope, 2 recipients); Dana is named by her 0x form 0x525fc93ddCDFDa0c12f6bd2A7eD202DB18B18926
+  pre-flight: eth_call of the exact addMember from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 95401 uqor from evmWindowCost; opened in 6A948F6B0A7B8670F78EE7DB03BEBC4071CB3EE82C91C3BB9DC2870E831C7157 (fee 0.036791 QOR)
+  tx:       0x9d9769dbb8962d2d089c307fb5bbc33057265b038490312c905c91de51a9d360, block 10237424, gas used 359156, fee 0.040406 QOR
+  events:   MemberAdded, EpochRotated, EnvelopeGranted
+  check:    the receipt carries MemberAdded, EpochRotated, EnvelopeGranted: yes
+  check:    board 13 is at epoch 1 and nonce 1, members the chair and Dana: yes
+  4b Eli, MODE_SEAL_CURRENT. Read at block 10237425: epoch 1, nonce 1
+  sealed:   the chair opened the epoch 1 key from grant 0 (sha256 and size match the chain), then sealed it to Eli alone (1729-byte envelope, 1 recipient)
+  pre-flight: eth_call of the exact addMember from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 85787 uqor from evmWindowCost; opened in 5AC35199319B14CF02EE2C4C84D6867FC3466E6C23DDE4B440DE4C527E257477 (fee 0.036791 QOR)
+  tx:       0x64df2ace10a5900ca586b7b0c4f935ffa3c12f6434802c1f8bbd291442269313, block 10237440, gas used 322961, fee 0.036334 QOR
+  events:   MemberAdded, EnvelopeGranted
+  check:    the receipt carries MemberAdded, EnvelopeGranted and no EpochRotated: yes
+  check:    board 13 stays at epoch 1, nonce 2, members the chair, Dana and Eli: yes
+  check:    getGrants(13, 1) lists Dana's MODE_ROTATE grant unchanged, then Eli's MODE_SEAL_CURRENT grant appended after it: yes
+
+5. The chair posts document 1 under epoch 1; Dana and Eli decrypt it
+  post doc 1: docs/spec/actions.md (5265 bytes) encrypted with encryptDocument under the epoch 1 key, which the chair opened from grant 0
+            the chain gets only its sha256 0xf3472be64b9b0655645bbac972917fbff0fa534be6e4dd9a8da2bd31496a8e0a and size 5293; read at block 10237441: epoch 1, nonce 2
+  pre-flight: eth_call of the exact postDocument from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 86741 uqor from evmWindowCost; opened in E857933F5B0D8C885F2E13E0B793F841581888849172607DF4E85340684C00CB (fee 0.036791 QOR)
+  tx:       0x51b0b92c89c35814379f8be6a996839cd3e886639ab72b06b0b76db879111d3a, block 10237455, gas used 326553, fee 0.036738 QOR
+  events:   DocumentPosted
+  check:    getDocument(13, 0) records this docRef, sha256 and size under epoch 1: yes
+  Dana:     opened epoch 1 grant 0 (the MODE_ROTATE grant) after its sha256 and size matched the chain, then decrypted document 0
+  check:    Dana's decrypted bytes equal the original 5265 bytes: yes
+  Eli:      opened epoch 1 grant 1 (the MODE_SEAL_CURRENT grant sealed to Eli) after its sha256 and size matched the chain, then decrypted document 0
+  check:    Eli's decrypted bytes equal the original 5265 bytes: yes
+  tamper:   Eli's envelope with one byte changed: HashMismatch; document 0 with one byte changed: HashMismatch
+  check:    both are refused with HashMismatch before any key touches them: yes
+
+6. The chair removes Eli and posts document 2 under epoch 2
+  check:    kept for attack 7d: a postDocument the chair signs now for epoch 1 at nonce 3, and eth_call of it passes now: yes
+  6a remove Eli. Read at block 10237458: epoch 1, nonce 3, members 0x64B85C422776d173A324fa72CC72f7Fffdd42d82, 0x525fc93ddCDFDa0c12f6bd2A7eD202DB18B18926, 0x6EECF4b4A2B7408D33931DA0E89B5c743A4BDF68
+  sealed:   a fresh epoch 2 key to the 2 members who stay, read from that same block (3361-byte envelope)
+  pre-flight: eth_call of the exact removeMember from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 80002 uqor from evmWindowCost; opened in DC7874ACA3BCFC052B52F4CBBEF655550FD77908B8E98BF12B28C984889C3B4F (fee 0.036791 QOR)
+  tx:       0xb3f0d7aeeccc69d6c93391d2f705f2954e5501b597e1cefb905b9a62525c4a85, block 10237475, gas used 291584, fee 0.032804 QOR
+  events:   MemberRemoved, EpochRotated, EnvelopeGranted
+  check:    the receipt carries MemberRemoved, EpochRotated, EnvelopeGranted: yes
+  check:    board 13 is at epoch 2 and nonce 4, members the chair and Dana: yes
+  check:    the epoch 2 envelope holds 2 recipient entries, one for each member the registry holds after the removal (matched by their on-chain ML-KEM keys), and none for Eli: yes
+  post doc 2: docs/security/threat-model.md (41149 bytes) encrypted with encryptDocument under the epoch 2 key, which the chair opened from grant 0
+            the chain gets only its sha256 0x1564e37ab7a09d297b1bd2f2e78047063e5d39686d6ae5c7e25ad7faa8c237db and size 41177; read at block 10237477: epoch 2, nonce 4
+  pre-flight: eth_call of the exact postDocument from the deployer passes
+  window:   allowed_targets [0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa], scoped, 1 tx, 200 blocks, max_value 82212 uqor from evmWindowCost; opened in 46A26A9294B1ABCD91C39D501799549F7799703B517D05DD3BC55C12B5935142 (fee 0.036791 QOR)
+  tx:       0x5dd2b18359d6a6a3cc69049d6743e22db81f294743efd6db745bc0b512928d0e, block 10237492, gas used 309501, fee 0.034819 QOR
+  events:   DocumentPosted
+  check:    getDocument(13, 1) records this docRef, sha256 and size under epoch 2: yes
+  Dana:     opened epoch 2 grant 0 after its sha256 and size matched the chain, then decrypted document 1
+  check:    Dana's decrypted bytes equal the original 41149 bytes: yes
+  Eli:      tries to open the epoch 2 envelope with his own keys: NOT_A_RECIPIENT
+  check:    Eli is refused with NOT_A_RECIPIENT: yes
+  Eli:      tries document 1 with the epoch 1 key he still holds: DocumentError
+  check:    the epoch 1 key does not decrypt an epoch 2 document: yes
+  check:    what a removed director keeps: Eli still opens his epoch 1 envelope and decrypts document 0 (5265 bytes, equal to the original): yes
+            A key already handed out cannot be taken back; the removal closes every document posted from now on.
+
+7. Attacks, each refused
+  Attacks a to h are each an eth_call of the exact transaction from the deployer; none is broadcast.
+  check:    7a setup: Dana's signature is a valid ML-DSA-87 signature under her own registered key: yes
+  7a: Dana, not a member of board 14, signs an addMember adding herself to it as if she were its chair
+      eth_call: refused, BadSignature(0x64B85C422776d173A324fa72CC72f7Fffdd42d82)
+  check:    refused with BadSignature: yes
+  check:    7b setup: the input of 0xd7a24cd1a0472706c9fffa81811c3a438ccc601b245dea407f7eb05433c95e95 read back from the chain is the createBoard calldata that landed: yes
+  7b: the landed createBoard 0xd7a24cd1a0472706c9fffa81811c3a438ccc601b245dea407f7eb05433c95e95 replayed byte for byte
+      eth_call: refused, BoardRefUsed(0x6ea8d09dbda5ae25a299e619de7a657bb348d1771c9006a6d49df889de6a5603)
+  check:    refused with BoardRefUsed or BadSignature: yes
+  check:    7c setup: the input of 0xb3f0d7aeeccc69d6c93391d2f705f2954e5501b597e1cefb905b9a62525c4a85 read back from the chain is the removeMember calldata that landed: yes
+  7c: the landed removeMember 0xb3f0d7aeeccc69d6c93391d2f705f2954e5501b597e1cefb905b9a62525c4a85 replayed byte for byte
+      eth_call: refused, NotMember(13, 0x6EECF4b4A2B7408D33931DA0E89B5c743A4BDF68)
+  check:    refused with NotMember or BadSignature: yes
+  7c: the same removal signature aimed at the board as it is now (remove Dana, epoch 3, board nonce 5), so every check before the signature passes
+      eth_call: refused, BadSignature(0x64B85C422776d173A324fa72CC72f7Fffdd42d82)
+  check:    refused with BadSignature: yes
+  7d: the postDocument the chair signed for epoch 1 before the removal, submitted now that board 13 is at epoch 2
+      eth_call: refused, WrongEpoch(2, 1)
+  check:    refused with WrongEpoch: yes
+  check:    7e setup: board 14 is at epoch 0 and nonce 0, as board 13 was when the chair signed Dana's addMember, so only the board id differs: yes
+  7e: the chair's landed addMember signature for board 13 (0x9d9769dbb8962d2d089c307fb5bbc33057265b038490312c905c91de51a9d360) submitted for board 14
+      eth_call: refused, BadSignature(0x64B85C422776d173A324fa72CC72f7Fffdd42d82)
+  check:    refused with BadSignature: yes
+  check:    7f control: a fresh postDocument the chair really signed at board nonce 5 passes eth_call: yes
+  7f: the same call with one byte of the signature flipped (byte 100)
+      eth_call: refused, BadSignature(0x64B85C422776d173A324fa72CC72f7Fffdd42d82)
+  check:    refused with BadSignature: yes
+  7g: the same post, signed by the chair with a deadline 3720 s after the latest block
+      eth_call: refused, DeadlineTooFar(1794897249, 1794897129)
+  check:    refused with DeadlineTooFar: yes
+  7h: the control post carrying 1 uqor of value
+      eth_call: refused, reverted with no error data (Execution reverted for an unknown reason.)
+  check:    refused with a revert carrying no error data: yes
+  7h: a plain transfer of 1 uqor to the registry with no calldata
+      eth_call: refused, reverted with no error data (Execution reverted for an unknown reason.)
+  check:    refused with a revert carrying no error data: yes
+  check:    7i setup: the chair's account 0x64B85C422776d173A324fa72CC72f7Fffdd42d82 has no live EVM window (stored window: false): yes
+  7i: the control post, sent as a plain EVM transaction from the chair's own account and signed with its secp256k1 key alone (0xc83c5ebc157514bb94000be97afb0a0ff9d72c5049a8bbd0c0bc8eed0a7cb1a2)
+      node:     failed to broadcast transaction: account qor1vju9cs38wmgh8geylfevcuhhll7agtvzx52h8m has no open EVM authorisation window; open one with MsgOpenEVMWindow, signed on the Cosmos lane with the account's post-quantum key: no open EVM authorisation window: no open EVM authorisation window [cosmossdk.io/errors@v1.0.2/errors.go:77]
+  check:    refused by the chain before any contract code runs: "no open EVM authorisation window": yes
+  check:    the transaction is not on chain and the chair's nonce is still 2: yes
+
+8. Summary
+  1. OK      Chain and registry
+  2. OK      Identities: chair, Dana, Eli
+  3. OK      The chair creates a board (3a), and a second one for attack 7e (3b)
+  4. OK      The chair adds Dana (MODE_ROTATE), then Eli (MODE_SEAL_CURRENT)
+  5. OK      The chair posts document 1 under epoch 1; Dana and Eli decrypt it
+  6. OK      The chair removes Eli and posts document 2 under epoch 2
+  7. OK      Attacks, each refused
+  result:   every step OK
+  spent:    0.532464 QOR realised: the deployer's bank balance went from 2.792261 to 2.259797 QOR. Nothing is unrealised; no QOR is held anywhere.
+            7 window opens 0.257553 QOR, 7 registry writes 0.274915 QOR, identity funding 0 QOR
+  live cost per action, measured in this run: gas used on chain, then what the action cost in QOR (the write's own fee plus the one-transaction window opened for it):
+    createBoard (3a)                416878 gas   0.083698  QOR (write 0.046899 + window 0.036799)   0xd7a24cd1a0472706c9fffa81811c3a438ccc601b245dea407f7eb05433c95e95
+    createBoard (3b)                417022 gas   0.083714  QOR (write 0.046915 + window 0.036799)   0x54b215b2e98592d6bf8e3f5b9f0fecca72258fb414a3105e6296b757edc1f5c3
+    addMember MODE_ROTATE           359156 gas   0.077197  QOR (write 0.040406 + window 0.036791)   0x9d9769dbb8962d2d089c307fb5bbc33057265b038490312c905c91de51a9d360
+    addMember MODE_SEAL_CURRENT     322961 gas   0.073125  QOR (write 0.036334 + window 0.036791)   0x64df2ace10a5900ca586b7b0c4f935ffa3c12f6434802c1f8bbd291442269313
+    postDocument (doc 1)            326553 gas   0.073529  QOR (write 0.036738 + window 0.036791)   0x51b0b92c89c35814379f8be6a996839cd3e886639ab72b06b0b76db879111d3a
+    removeMember                    291584 gas   0.069595  QOR (write 0.032804 + window 0.036791)   0xb3f0d7aeeccc69d6c93391d2f705f2954e5501b597e1cefb905b9a62525c4a85
+    postDocument (doc 2)            309501 gas   0.07161   QOR (write 0.034819 + window 0.036791)   0x5dd2b18359d6a6a3cc69049d6743e22db81f294743efd6db745bc0b512928d0e
+  window:   the deployer's last window has 0 transactions and 0 uqor left (live false)
+
+report:   deployments/prove-registry-20261117T052913Z.txt
