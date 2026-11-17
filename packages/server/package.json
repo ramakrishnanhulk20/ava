@@ -1,0 +1,41 @@
+{
+  "name": "@ava/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ava's server handlers: shared state, rate limits, the chain REST proxy and the blob upload, as plain web handlers the app mounts.",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "gen-abi": "tsx scripts/gen-abi.ts",
+    "new-relayer": "tsx scripts/new-relayer.ts",
+    "register-relayer": "tsx scripts/register-relayer.ts",
+    "live-relay-check": "tsx scripts/live-relay-check.ts",
+    "rotate-demo-chair": "tsx scripts/rotate-demo-chair.ts"
+  },
+  "dependencies": {
+    "@ava/core": "file:../core",
+    "@cosmjs/stargate": "0.39.0",
+    "@qorechain/evm": "0.14.0",
+    "@qorechain/pqc": "0.2.3",
+    "@qorechain/qoreseal": "0.1.0",
+    "@qorechain/sdk": "0.14.0",
+    "@upstash/redis": "1.41.0",
+    "@vercel/blob": "2.9.0",
+    "viem": "2.57.20",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  }
+}
