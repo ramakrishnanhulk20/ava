@@ -1,0 +1,31 @@
+{
+  "name": "@ava/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The one library every part of Ava uses to build signed board actions, check addresses and hashes, seal epoch keys and encrypt documents.",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "vectors": "tsx scripts/vectors.ts"
+  },
+  "dependencies": {
+    "@qorechain/pqc": "0.2.3",
+    "@qorechain/qoreseal": "0.1.0",
+    "@qorechain/qoresign": "0.1.0",
+    "@qorechain/sdk": "0.14.0",
+    "viem": "2.57.20"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
