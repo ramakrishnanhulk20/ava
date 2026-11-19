@@ -299,6 +299,29 @@ async function main(): Promise<void> {
   };
   const chair = await identityFromMnemonic(env.DEMO_CHAIR_MNEMONIC);
 
+  // A run that stopped after pack 2 can be finished on the same board instead of seeding a second
+  // one; it continues only when the board is exactly where a seed leaves it after pack 2.
+  const resumeAt = process.argv.indexOf("--resume-board");
+  if (resumeAt !== -1) {
+    const boardId = BigInt(process.argv[resumeAt + 1] ?? "0");
+    const saved = await Promise.all(DIRECTORS.map(async (d) => {
+      const phrase = process.env[d.variable];
+      if (phrase === undefined || phrase === "") throw new Error(`${d.variable} is not in ${ENV_PATH}. Cannot resume.`);
+      return identityFromMnemonic(phrase);
+    }));
+    const [asha, ben, chen] = saved;
+    if (asha === undefined || ben === undefined || chen === undefined) throw new Error("A director is missing. Stopping.");
+    const stored = await client.readContract({ address: REGISTRY_ADDRESS, abi: boardRegistryAbi, functionName: "getBoard", args: [boardId] });
+    const snapshot = await chain.board(boardId);
+    const expected = [chair.evm, asha.evm, ben.evm, chen.evm];
+    const matches = sameAccount(snapshot.chair, chair.evm) && snapshot.epoch === 2n && stored.documentCount === 2
+      && snapshot.members.length === expected.length && expected.every((a) => snapshot.members.some((m) => sameAccount(m, a)));
+    if (!matches) throw new Error(`Board ${boardId} is not where a seed stops after pack 2. Nothing was sent.`);
+    console.log(`resume:   board ${boardId}, epoch ${snapshot.epoch}, nonce ${snapshot.nonce}, 4 members, 2 packs: finishing from the removal of Chen`);
+    await finish(live, chain, chair, boardId, stored.boardRef, snapshot, [asha, ben, chen]);
+    return;
+  }
+
   // One at a time: each onboarding spends from the sponsor, whose sends are queued anyway.
   const directors: Identity[] = [];
   for (const d of DIRECTORS) directors.push(await onboard(live, d.name, d.variable));
@@ -339,7 +362,26 @@ async function main(): Promise<void> {
   );
   snapshot = await chain.board(boardId);
   await postPack(live, chair, snapshot, current, 2, `Posted in epoch ${snapshot.epoch}, after Chen joined by having the current key sealed to Chen alone. Chen can read packs 1 and 2: joining an epoch exposes everything posted in it, and the exposure ledger shows that.`);
+  // Posting moves the board nonce, so the removal must be signed over a fresh read.
+  snapshot = await chain.board(boardId);
+  await finish(live, chain, chair, boardId, boardRef, snapshot, [asha, ben, chen]);
+}
 
+type Snapshot = Awaited<ReturnType<ReturnType<typeof liveDemoChain>["board"]>>;
+
+/** Removes Chen, posts pack 3, and writes DEMO_BOARD_ID and DEMO_SEEDED: the last stretch of a seed. */
+async function finish(
+  live: Live,
+
+  chain: ReturnType<typeof liveDemoChain>,
+  chair: Identity,
+  boardId: bigint,
+  boardRef: `0x${string}`,
+  start: Snapshot,
+  [asha, ben, chen]: Identity[],
+): Promise<void> {
+  if (asha === undefined || ben === undefined || chen === undefined) throw new Error("A director is missing. Stopping.");
+  let snapshot = start;
   const remaining = snapshot.members.filter((m) => !sameAccount(m, chen.evm));
   const fresh = await sealFresh(live, boardRef, snapshot.epoch + 1n, remaining);
   await relayed(live, `remove Chen (to epoch ${snapshot.epoch + 1n})`, signedAction(chair, snapshot, { kind: "remove", member: chen.evm, envelopeHash: fresh.hash, envelopeSize: fresh.size, epochAfter: snapshot.epoch + 1n }));
