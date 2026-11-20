@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { validateMnemonic } from "@qorechain/sdk";
+import { canonicalPhrase } from "@ava/core";
 
 export const CHAIN_ID = "qorechain-diana";
 export const REST = "https://api-testnet.qore.host";
@@ -26,26 +26,23 @@ export const PROBE_ARTIFACT_PATH = fileURLToPath(new URL("../out/PqcProbe.sol/Pq
 export const HTTP = { retries: 4, retryDelayMs: 2_000, timeoutMs: 20_000 } as const;
 
 const MNEMONIC_VAR = "M1_DEPLOYER_MNEMONIC";
-const MNEMONIC_WORDS = 24;
 
 if (existsSync(ENV_PATH)) process.loadEnvFile(ENV_PATH);
 
 /**
- * Error messages here name the variable, never its value: the phrase must not
- * reach a terminal or a log even when it is malformed.
+ * The phrase in @ava/core's canonicalPhrase form, the one rule every reader in
+ * the product uses (threat model C16). Error messages here name the variable,
+ * never its value: the phrase must not reach a terminal or a log even when it
+ * is malformed.
  */
 function readMnemonic(): string | undefined {
   const raw = process.env[MNEMONIC_VAR];
   if (raw === undefined || raw.trim() === "") return undefined;
-  const mnemonic = raw.trim().split(/\s+/).join(" ");
-  const words = mnemonic.split(" ").length;
-  if (words !== MNEMONIC_WORDS) {
-    throw new Error(`${MNEMONIC_VAR} in ${ENV_PATH} has ${words} words; it must have ${MNEMONIC_WORDS}.`);
+  try {
+    return canonicalPhrase(raw);
+  } catch {
+    throw new Error(`${MNEMONIC_VAR} in ${ENV_PATH} is not 24 valid BIP-39 words (word count, word list or checksum).`);
   }
-  if (!validateMnemonic(mnemonic)) {
-    throw new Error(`${MNEMONIC_VAR} in ${ENV_PATH} fails the BIP-39 word list or checksum check.`);
-  }
-  return mnemonic;
 }
 
 // Validated on first use rather than at import, so a bad phrase reaches each

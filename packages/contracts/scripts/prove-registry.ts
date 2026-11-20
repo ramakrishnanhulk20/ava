@@ -24,6 +24,8 @@ import {
   sha256,
   signAction,
   verifyAction,
+  type FreshEpochKey,
+  type OpenedEpochKey,
 } from "@ava/core";
 import { classifyEvmWindowRejection } from "@qorechain/evm";
 import { parseEnvelope, recipientHint } from "@qorechain/qoreseal";
@@ -34,7 +36,7 @@ import { deriveDeployer, type Deployer } from "./account.js";
 import { assertTestnet, evmClient } from "./chain.js";
 import { CHAIN_ID, EVM_CHAIN_ID, REST, requireMnemonic } from "./env.js";
 import { BudgetError, DEPLOYER_FLOOR_UQOR, balanceOf, fees, formatQor, withHeadroom } from "./lib/evm.js";
-import { ensureIdentity, kemKeyOf, precompileKeyStatus, restShowsProvenKey } from "./lib/identities.js";
+import { ensureIdentity, kemRecipientOf, precompileKeyStatus, restShowsProvenKey } from "./lib/identities.js";
 import {
   boardAt,
   callFromDeployer,
@@ -147,10 +149,10 @@ class Proof {
     return bytesToHex(signAction(person.pqc.secretKey, actionMessage({ registry: this.reg.address, ...a })));
   }
 
-  /** Seals an epoch key to each address's ML-KEM key as qor_getKEMKey returns it for that address (C15). */
-  async sealTo(addresses: readonly Hex[], boardRef: Hex, epoch: bigint, epochKey: Uint8Array): Promise<Uint8Array> {
+  /** Seals an epoch key to each address as the pair qor_getKEMKey returns for that address (C15). */
+  async sealTo(addresses: readonly Hex[], boardRef: Hex, epoch: bigint, epochKey: FreshEpochKey | OpenedEpochKey): Promise<Uint8Array> {
     const recipients = [];
-    for (const address of addresses) recipients.push({ address, kemPublicKey: await kemKeyOf(address) });
+    for (const address of addresses) recipients.push(await kemRecipientOf(address));
     return sealEpochKey({ registry: this.reg.address, boardRef, epoch, epochKey, recipients });
   }
 
@@ -191,8 +193,11 @@ async function identities(p: Proof): Promise<void> {
       st.registered && st.algorithmId === 1 && st.possessionProven && st.pubkey.length === 2592 && sameBytes(st.pubkey, a.pqc.publicKey),
       `${role}: pqcKeyStatus(${a.evm}), the precompile the registry reads, says registered, algorithm 1, possessionProven, 2,592-byte key equal to this phrase's`,
     );
-    const kem = await kemKeyOf(a.evm);
-    p.check(sameBytes(kem, a.seal.mlkemPublicKey), `${role}: KEM key found via qor_getKEMKey(${a.evm}): algorithm 2, 1,568 bytes, account matched as 20 bytes, this phrase's key`);
+    const kem = await kemRecipientOf(a.evm);
+    p.check(
+      sameAccount(kem.address, a.evm) && sameBytes(kem.kemPublicKey, a.seal.mlkemPublicKey),
+      `${role}: KEM key found via qor_getKEMKey(${a.evm}): algorithm 2, 1,568 bytes, account matched as 20 bytes, this phrase's key`,
+    );
   }
   const [chair, dana, eli] = setups.map((s) => s.account) as [Deployer, Deployer, Deployer];
   p.people = { chair, dana, eli };
@@ -240,7 +245,7 @@ async function createBoards(p: Proof): Promise<void> {
  * to them, or else the epoch's MODE_ROTATE grant. openEpochKey refuses the bytes unless their size
  * and SHA-256 are the ones the registry recorded (C12).
  */
-async function openFor(p: Proof, person: Deployer, boardId: bigint, boardRef: Hex, epoch: bigint): Promise<{ key: Uint8Array; index: number; grant: Grant }> {
+async function openFor(p: Proof, person: Deployer, boardId: bigint, boardRef: Hex, epoch: bigint): Promise<{ key: OpenedEpochKey; index: number; grant: Grant }> {
   const grants = await grantsOf(p.reg, boardId, epoch);
   let index = grants.findIndex((g) => g.mode === Mode.SEAL_CURRENT && sameAccount(g.member, person.evm));
   if (index < 0) index = grants.findIndex((g) => g.mode === Mode.ROTATE);
@@ -437,7 +442,7 @@ async function removeEli(p: Proof): Promise<void> {
   // Anyone holding the members' public keys can run this count (QoreSeal's recipient hints).
   const parsed = parseEnvelope(envelope);
   const hints = parsed.entries.map((e) => bytesToHex(e.hint));
-  const hintFor = async (address: Hex): Promise<Hex> => bytesToHex(recipientHint(parsed.salt, await kemKeyOf(address)));
+  const hintFor = async (address: Hex): Promise<Hex> => bytesToHex(recipientHint(parsed.salt, (await kemRecipientOf(address)).kemPublicKey));
   const memberHints: Hex[] = [];
   for (const m of after.members) memberHints.push(await hintFor(m));
   const eliHint = await hintFor(eli.evm);

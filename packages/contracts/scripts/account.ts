@@ -1,3 +1,4 @@
+import { canonicalPhrase } from "@ava/core";
 import { deriveUnifiedAccount, derivePqcCanonical, bech32ToHex, isValidBech32, isValidEvmAddress, toChecksumAddress, type PqcKeypair, type UnifiedAccount } from "@qorechain/sdk";
 import { deriveSealKeys, type SealKeyPair } from "@qorechain/qoreseal";
 
@@ -62,13 +63,19 @@ export function sameAccount(a: string, b: string): boolean {
  * account: one eth_secp256k1 key on m/44'/60'/0'/0/0, so the qor1 address, the
  * 0x address and the key that signs EVM transactions are one account.
  *
- * @throws When the phrase is invalid, when derivePqcCanonical and the SDK's
- *   unified account disagree on the ML-DSA-87 key, or when the two address
- *   forms are not the same 20 bytes.
+ * Every derivation reads the phrase only after @ava/core's canonicalPhrase, the
+ * rule the app uses (threat model C16). The SDK hashes the raw string into the
+ * ML-DSA-87 seed, so a phrase pasted with a no-break space would otherwise give
+ * the right address and a different signing key.
+ *
+ * @throws When the phrase is not 24 valid words (the message never repeats it),
+ *   when derivePqcCanonical and the SDK's unified account disagree on the
+ *   ML-DSA-87 key, or when the two address forms are not the same 20 bytes.
  */
 export async function deriveDeployer(mnemonic: string): Promise<Deployer> {
-  const unified = await deriveUnifiedAccount(mnemonic, 0);
-  const pqc = derivePqcCanonical(unified.cosmos, mnemonic);
+  const phrase = canonicalPhrase(mnemonic);
+  const unified = await deriveUnifiedAccount(phrase, 0);
+  const pqc = derivePqcCanonical(unified.cosmos, phrase);
   if (!Buffer.from(pqc.publicKey).equals(Buffer.from(unified.pqc.publicKey))) {
     throw new Error("derivePqcCanonical and deriveUnifiedAccount give different ML-DSA-87 keys. Refusing to continue.");
   }
@@ -80,7 +87,7 @@ export async function deriveDeployer(mnemonic: string): Promise<Deployer> {
     evm: unified.evm as `0x${string}`,
     privateKey: hex32(unified.privateKey, "the derived private key"),
     pqc,
-    seal: deriveSealKeys({ mnemonic, index: 0 }),
+    seal: deriveSealKeys({ mnemonic: phrase, index: 0 }),
     unified,
   };
 }

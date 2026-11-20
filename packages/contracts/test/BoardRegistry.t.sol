@@ -1,4 +1,4 @@
-// Does not cover: real ML-DSA-87 maths or the real precompiles (mocks stand in for both; BoardRegistryRealSig.t.sol uses real signatures), the byte-for-byte check against packages/core's test vectors (BoardRegistryVectors.t.sol), or fuzzing and invariant tests, which come in the next order.
+// Does not cover: real ML-DSA-87 maths or the real precompiles (mocks stand in for both; BoardRegistryRealSig.t.sol uses real signatures), the byte-for-byte check against packages/core's test vectors (BoardRegistryVectors.t.sol), or fuzzing and invariant tests (BoardRegistryFuzz.t.sol and the test/invariant/ folder).
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.38;
 

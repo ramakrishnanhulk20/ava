@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { parseEnv } from "node:util";
-import { KemKeyUnavailable, fetchKemKey, generateMnemonic, sameAccount } from "@ava/core";
+import { KemKeyUnavailable, canonicalPhrase, fetchKemKey, generateMnemonic, sameAccount, type KemRecipient } from "@ava/core";
 import {
   buildRegisterPqcKeyMsg,
   clearPqcStatusCache,
@@ -10,7 +10,6 @@ import {
   msg,
   qorechainRegistry,
   signProofOfPossession,
-  validateMnemonic,
   verifyProofOfPossession,
   withRetry,
   type KemKeyResult,
@@ -57,16 +56,18 @@ export interface IdentitySetup {
 
 /**
  * Reads one identity phrase from the environment, or writes a fresh one into .env when the
- * variable has no line there. Messages name the variable, never its value.
+ * variable has no line there. Either way the phrase comes back in @ava/core's canonicalPhrase
+ * form, the rule the app derives from (threat model C16). Messages name the variable, never its
+ * value.
  */
 function ensureMnemonic(name: string): { mnemonic: string; created: boolean } {
   const raw = process.env[name];
   if (raw !== undefined && raw.trim() !== "") {
-    const mnemonic = raw.trim().split(/\s+/).join(" ");
-    if (mnemonic.split(" ").length !== MNEMONIC_WORDS || !validateMnemonic(mnemonic)) {
+    try {
+      return { mnemonic: canonicalPhrase(raw), created: false };
+    } catch {
       throw new Error(`${name} in ${ENV_PATH} is not a valid ${MNEMONIC_WORDS}-word BIP-39 phrase.`);
     }
-    return { mnemonic, created: false };
   }
   const existing = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, "utf8") : "";
   // An empty line for the name counts: a second line would leave it to the parser which one wins.
@@ -74,7 +75,8 @@ function ensureMnemonic(name: string): { mnemonic: string; created: boolean } {
     throw new Error(`${ENV_PATH} has an empty ${name} line. Delete the line to have a new identity made, or fill it.`);
   }
   const mnemonic = generateMnemonic();
-  if (mnemonic.split(" ").length !== MNEMONIC_WORDS || !validateMnemonic(mnemonic)) throw new Error("The new phrase is not 24 valid words. Nothing was written.");
+  // canonicalPhrase throws a message that never repeats the phrase, so nothing is caught here.
+  if (canonicalPhrase(mnemonic) !== mnemonic) throw new Error("The new phrase is not in canonical form. Nothing was written.");
   const lead = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
   appendFileSync(ENV_PATH, `${lead}${name}="${mnemonic}"\n`, { encoding: "utf8", mode: 0o600 });
   if (parseEnv(readFileSync(ENV_PATH, "utf8"))[name] !== mnemonic) {
@@ -191,11 +193,11 @@ export async function precompileKeyStatus(client: PublicClient, address: Hex): P
 }
 
 /**
- * The account's ML-KEM-1024 key from qor_getKEMKey on the public EVM JSON-RPC, through
- * @ava/core's fetchKemKey (threat model C15). Only a dropped connection or a timeout is retried;
- * every other refusal stops at once.
+ * The account and the ML-KEM-1024 key qor_getKEMKey publishes for it, as one KemRecipient pair from
+ * @ava/core's fetchKemKey (threat model C15), so a seal names only the account the key was read for.
+ * Only a dropped connection or a timeout is retried; every other refusal stops at once.
  */
-export async function kemKeyOf(address: string): Promise<Uint8Array> {
+export async function kemRecipientOf(address: string): Promise<KemRecipient> {
   return withRetry(() => fetchKemKey(address), {
     retries: 4,
     backoff: 2_000,
