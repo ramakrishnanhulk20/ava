@@ -1,11 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { toHex, toQor1 } from "@ava/core";
+import { BroadcastTxError } from "@cosmjs/stargate";
 import { fetchPqcStatus, msg } from "@qorechain/sdk";
 import { bytesToHex, type Hex } from "viem";
 import { z } from "zod";
 import { publicAddress, relayerFromMnemonic, type RelayerAccount, type RelayerAddress } from "./chain/account.ts";
 import { leftMs, startDeadline, within, type Deadline } from "./chain/deadline.ts";
 import { evmClient } from "./chain/evm.ts";
-import { balanceOf, sendNative } from "./chain/native.ts";
+import { RefusedBeforeInclusion, balanceOf, sendNative } from "./chain/native.ts";
 import {
   DENOM,
   HTTP,
@@ -19,11 +21,11 @@ import {
   SPONSOR_SEND_FEE,
   SPONSOR_SEND_FEE_UQOR,
 } from "./config.ts";
-import { declaredLength, json, readCapped, refuse, TooLarge, type HandlerContext } from "./http.ts";
+import { BodyTimeout, declaredLength, json, readBody, refuse, refuseCrossSite, TooLarge, type HandlerContext } from "./http.ts";
 import { logEvent } from "./log.ts";
-import { clientKey } from "./ratelimit.ts";
+import { countClient } from "./ratelimit.ts";
 import { accountBytesStrict } from "./requestAddress.ts";
-import { LockBusy, type SharedStore } from "./store.ts";
+import { LockBusy, claimOnce, type SharedStore } from "./store.ts";
 
 /**
  * What the sponsor endpoint needs from the chain. The live implementation keeps the sponsor's keys
@@ -39,6 +41,8 @@ export interface SponsorChain {
   /**
    * Sends exactly SPONSOR_AMOUNT_UQOR from the sponsor to `toQor1` by one hybrid-signed MsgSend and
    * resolves with the committed hash, all by `deadline`. The amount is not a parameter on purpose.
+   * Throws RefusedBeforeInclusion (or the cosmjs BroadcastTxError it wraps) only when the node
+   * refused the transaction before any block, so nothing can land.
    */
   send(toQor1: string, deadline: Deadline): Promise<string>;
 }
@@ -72,6 +76,12 @@ const BODY_CAP = 256;
 const COST_UQOR = SPONSOR_AMOUNT_UQOR + SPONSOR_SEND_FEE_UQOR;
 
 const SponsorBody = z.strictObject({ address: z.string().max(64) });
+
+/**
+ * Whether a failed send certainly sent nothing: the node refused it at broadcast, before any block.
+ * sendNative turns the cosmjs BroadcastTxError into RefusedBeforeInclusion; both mean the same.
+ */
+const refusedBeforeInclusion = (error: unknown): boolean => error instanceof RefusedBeforeInclusion || error instanceof BroadcastTxError;
 
 /** The once-per-address mark, keyed on the 20 bytes so every form of one account lands on one key (C16). */
 export function sponsoredKey(account: Uint8Array): string {
@@ -113,8 +123,9 @@ async function readAccount(request: Request): Promise<{ account: Uint8Array } | 
   if (request.body === null) return { response: refusal(400, "bad_body") };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readCapped(request.body, BODY_CAP)));
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBody(request.body, BODY_CAP)));
   } catch (error) {
+    if (error instanceof BodyTimeout) return { response: refusal(408, "body_timeout") };
     return { response: error instanceof TooLarge ? refusal(413, "body_too_large") : refusal(400, "bad_body") };
   }
   const checked = SponsorBody.safeParse(parsed);
@@ -128,6 +139,24 @@ async function readAccount(request: Request): Promise<{ account: Uint8Array } | 
   // Nobody holds the key of the zero account, so anything sent there is gone.
   if (account.every((b) => b === 0)) return { response: refusal(400, "bad_address") };
   return { account };
+}
+
+/** Takes the address's mark back after a refusal that sent nothing. A failure is logged; a mark not yet kept still ends with the lock. */
+async function releaseMark(store: SharedStore, account: Uint8Array, fields: Fields): Promise<void> {
+  await store.delete(sponsoredKey(account)).catch(() => logEvent("sponsor_mark_release_failed", fields));
+}
+
+/**
+ * Makes the address's mark permanent, as this request wrote it. With `next` equal to `expected`, a
+ * retried write that had already landed still answers true; false means the mark is no longer this
+ * request's or the store failed, so nothing may be sent.
+ */
+async function keepMark(store: SharedStore, account: Uint8Array, mine: string): Promise<boolean> {
+  try {
+    return await store.compareAndSet(sponsoredKey(account), mine, mine, SPONSOR_MARK_SECONDS);
+  } catch {
+    return false;
+  }
 }
 
 /** Everything that spends, while holding "sponsor:send": one send at a time, so the sponsor's sequence never collides. */
@@ -144,12 +173,14 @@ async function sendOnce(ctx: SponsorContext, account: Uint8Array, qor1: string, 
     return refusal(503, "store_unavailable", fields);
   }
 
-  // The once-per-address mark is written before anything is sent. A second request for this
-  // address answers 409 even if this send then fails: there are no retries, by design, so no
-  // failure, lost answer or race can ever turn into a second payment to one account.
+  // The once-per-address mark lives only as long as the lock until the send is about to start, so a
+  // refusal before it gives the address its chance back, even when taking the mark back fails too.
+  // Its value is this request's alone: two requests for one address can arrive in one millisecond,
+  // and the read-back that counts a retried write as this request's must never count the other's.
+  const mine = `${ctx.now}:${randomUUID()}`;
   let first: boolean;
   try {
-    first = await ctx.store.setIfAbsent(sponsoredKey(account), String(ctx.now), SPONSOR_MARK_SECONDS);
+    first = await claimOnce(ctx.store, sponsoredKey(account), mine, LOCK_TTL_SECONDS);
   } catch {
     return refusal(503, "store_unavailable", fields);
   }
@@ -158,15 +189,31 @@ async function sendOnce(ctx: SponsorContext, account: Uint8Array, qor1: string, 
   try {
     const count = await ctx.store.incrWindow(day.count, DAY_KEY_SECONDS);
     const spent = await ctx.store.incrWindow(day.spend, DAY_KEY_SECONDS, Number(COST_UQOR));
-    if (count > limits.perDay || BigInt(spent) > limits.dailyCapUqor) return refusal(503, "daily_limit", { ...fields, limit: "race" }, tomorrow);
+    if (count > limits.perDay || BigInt(spent) > limits.dailyCapUqor) {
+      await releaseMark(ctx.store, account, fields);
+      return refusal(503, "daily_limit", { ...fields, limit: "race" }, tomorrow);
+    }
   } catch {
+    await releaseMark(ctx.store, account, fields);
+    return refusal(503, "store_unavailable", fields);
+  }
+
+  // From here a lost answer or a timeout may still land, so the mark is kept for good before the
+  // send starts: a second request answers 409 even if this send fails, unless the node refused it
+  // before any block, and no failure can turn into a second payment.
+  if (!(await keepMark(ctx.store, account, mine))) {
+    await releaseMark(ctx.store, account, fields);
     return refusal(503, "store_unavailable", fields);
   }
 
   let hash: string;
   try {
     hash = await ctx.chain.send(qor1, deadline);
-  } catch {
+  } catch (error) {
+    if (refusedBeforeInclusion(error)) {
+      await releaseMark(ctx.store, account, fields);
+      return refusal(502, "send_failed", { ...fields, mark: "released" });
+    }
     return refusal(502, "send_failed", fields);
   }
   if (!/^[0-9A-F]{64}$/.test(hash)) return refusal(502, "send_failed", fields);
@@ -178,8 +225,11 @@ async function sendOnce(ctx: SponsorContext, account: Uint8Array, qor1: string, 
  * Sends a new identity the QOR for its two key registrations, once (threat model C16, C23, C27,
  * C31, C32).
  *
- * Admission, in order: POST only (405); this IP's hourly limit, counted before the body is read
- * (429); `application/json` (415); at most 256 bytes (413); exactly `{ address }`, decoded by the
+ * Admission, in order: a request another site's page could have sent (403 cross_site), before
+ * anything is counted or read; POST only (405); this IP's hourly limit, counted before the body is
+ * read, with every /64 of one IPv6 /48 also sharing 4 times it (countClient, 429);
+ * `application/json` (415); at most 256 bytes (413), ending within 20 seconds (408
+ * body_timeout); exactly `{ address }`, decoded by the
  * strict shared address codec (qor1, or 0x in exact EIP-55 form), never the zero account (400); an
  * address already sponsored (409); the
  * chain's answers, read with timeouts, where any failed lookup refuses (502): an address with
@@ -187,27 +237,29 @@ async function sendOnce(ctx: SponsorContext, account: Uint8Array, qor1: string, 
  *
  * Then, under the shared lock "sponsor:send" (waiting up to 20 s, else 503 busy): at least 15 s of
  * the 55 s budget left (503 out_of_time); the day's 100 sends and 25 QOR, amount and fee counted
- * (503 daily_limit until UTC midnight); the once-per-address mark written atomically (409 if another
- * request won); the day's counters; one hybrid-signed MsgSend of SPONSOR_AMOUNT_UQOR, waited for
- * until its block. Classical keys never send it. A store failure anywhere refuses (503).
+ * (503 daily_limit until UTC midnight); the once-per-address mark written atomically with a value
+ * this request alone holds, living only the lock's 60 s for now (409 if another request won; a
+ * write retried after a lost reply reads back as this request's, claimOnce); the day's counters, the mark taken back if
+ * they refuse (503 daily_limit) or fail; the mark made permanent; one hybrid-signed MsgSend of
+ * SPONSOR_AMOUNT_UQOR, waited for until its block. Classical keys never send it. A store failure
+ * anywhere refuses (503), and before the send it never uses up the address's chance. A failed
+ * send answers 502 send_failed and keeps the mark, so no lost answer can become a second payment;
+ * only a send the node refused before any block (RefusedBeforeInclusion, the cosmjs
+ * BroadcastTxError) gives the mark back, because nothing of it can land.
  *
  * @returns 202 with `{ txHash }` only: the committed transaction's hash, never a claim that the
  *   identity is ready. The caller reads its balance before registering keys.
  */
 export async function handleSponsor(request: Request, ctx: SponsorContext): Promise<Response> {
+  const crossSite = refuseCrossSite(request);
+  if (crossSite !== undefined) return crossSite;
   const deadline = startDeadline(SPONSOR_DEADLINE_MS, ctx.clock);
   if (request.method !== "POST") return refusal(405, "method_not_allowed", {}, { allow: "POST" });
   const limits = ctx.limits ?? SPONSOR_LIMITS;
   const retry = { "retry-after": String(limits.windowSeconds) };
-  const ip = clientKey(ctx.clientIp);
-  if (ip === undefined) return refusal(429, "rate_limited", { limit: "bad_client_ip" }, retry);
-  try {
-    if ((await ctx.store.incrWindow(`rate:sponsor:ip:${ip}`, limits.windowSeconds)) > limits.perIp) {
-      return refusal(429, "rate_limited", { ip, limit: "per_ip" }, retry);
-    }
-  } catch {
-    return refusal(429, "rate_limited", { limit: "store_error" }, retry);
-  }
+  // Per IP, and per IPv6 /48 at 4 times that, with the one rule every endpoint uses (C23).
+  const client = await countClient(ctx.store, { scope: "sponsor", clientIp: ctx.clientIp, perIp: limits.perIp, windowSeconds: limits.windowSeconds });
+  if (!client.ok) return refusal(429, "rate_limited", { limit: client.refusedBy ?? "per_ip" }, retry);
 
   const read = await readAccount(request);
   if ("response" in read) return read.response;

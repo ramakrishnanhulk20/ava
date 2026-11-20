@@ -1,6 +1,7 @@
 import { derivePqcCanonical, deriveUnifiedAccount, validateMnemonic, type PqcKeypair, type UnifiedAccount } from "@qorechain/sdk";
-import { accountBytes, sameAccount, toHex, toQor1 } from "@ava/core";
+import { accountBytes, canonicalPhrase, sameAccount, toHex, toQor1 } from "@ava/core";
 import type { Hex } from "viem";
+import { mnemonicToAccount } from "viem/accounts";
 
 const MNEMONIC_WORDS = 24;
 
@@ -28,15 +29,38 @@ export interface RelayerAddress {
   evm: Hex;
 }
 
-/** The phrase with surrounding and repeated whitespace removed, the one form every reader derives from. */
+/**
+ * The one form every reader derives from: @ava/core's canonicalPhrase (NFKD, trimmed, single ASCII
+ * spaces), so a phrase pasted with full-width letters or odd spacing gives the relayer, the sponsor
+ * and the demo chair the same keys the core identity gives (threat model C16).
+ *
+ * @throws Error "The recovery phrase is not 24 valid words." for anything else; it never repeats the input.
+ */
 export function normalizeMnemonic(raw: string): string {
-  return raw.trim().split(/\s+/).join(" ");
+  return canonicalPhrase(raw);
 }
 
-/** Whether the value is a 24-word BIP-39 phrase with a valid checksum, once normalised. */
+/** Whether the value is a 24-word BIP-39 phrase with a valid checksum, once normalised. Never throws. */
 export function isRelayerMnemonic(raw: string): boolean {
-  const mnemonic = normalizeMnemonic(raw);
+  let mnemonic: string;
+  try {
+    mnemonic = normalizeMnemonic(raw);
+  } catch {
+    return false;
+  }
   return mnemonic.split(" ").length === MNEMONIC_WORDS && validateMnemonic(mnemonic);
+}
+
+/**
+ * The 0x address a phrase derives on m/44'/60'/0'/0/0, worked out without waiting so the settings
+ * can be checked at boot. It is the address relayerFromMnemonic and the demo chair's identity give
+ * for the same phrase (test/env.test.ts proves both).
+ *
+ * @throws When the phrase is not 24 valid words; the message never repeats it.
+ */
+export function evmAddressOf(raw: string): Hex {
+  if (!isRelayerMnemonic(raw)) throw new Error(`The phrase is not ${MNEMONIC_WORDS} valid BIP-39 words.`);
+  return mnemonicToAccount(normalizeMnemonic(raw)).address;
 }
 
 /**

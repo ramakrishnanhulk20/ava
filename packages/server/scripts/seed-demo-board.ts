@@ -14,14 +14,17 @@ import {
   sameAccount,
   sealEpochKey,
   sha256,
+  type FreshEpochKey,
   type Identity,
+  type KemRecipient,
+  type OpenedEpochKey,
 } from "@ava/core";
 import { buildRegisterPqcKeyMsg, clearPqcStatusCache, fetchPqcStatus, isRegisteredPqcKey, msg, signProofOfPossession, verifyProofOfPossession, withRetry } from "@qorechain/sdk";
 import { put } from "@vercel/blob/client";
 import { bytesToHex, type Hex, type PublicClient } from "viem";
 import { boardRegistryAbi } from "../src/abi/boardRegistry.ts";
 import { VercelBlobBackend } from "../src/blob.ts";
-import { isRelayerMnemonic, publicAddress, relayerFromMnemonic, type RelayerAccount } from "../src/chain/account.ts";
+import { isRelayerMnemonic, normalizeMnemonic, publicAddress, relayerFromMnemonic, type RelayerAccount } from "../src/chain/account.ts";
 import { startDeadline } from "../src/chain/deadline.ts";
 import { codeKeccak, evmClient } from "../src/chain/evm.ts";
 import { assertTestnet, liveChain } from "../src/chain/live.ts";
@@ -52,8 +55,8 @@ const DIRECTORS = [
   { name: "Ben", variable: "DEMO_BEN_MNEMONIC" },
   { name: "Chen", variable: "DEMO_CHEN_MNEMONIC" },
 ] as const;
-// Each script counts under its own loopback address, so its sponsorships and uploads never use up
-// another script's or the local dev server's hourly allowance.
+// Each script counts under its own loopback address, so its sponsorships and relays never use up
+// another script's or the local dev server's hourly allowance. Its envelope uploads are internal.
 const CLIENT_IP = "127.0.0.2";
 const MNEMONIC_WORDS = 24;
 // Eight relayed actions at about 0.04 QOR each plus one window open, with room to spare.
@@ -87,7 +90,7 @@ function ensureMnemonic(variable: string): string {
   const raw = process.env[variable];
   if (raw !== undefined && raw.trim() !== "") {
     if (!isRelayerMnemonic(raw)) throw new Error(`${variable} in ${ENV_PATH} is not ${MNEMONIC_WORDS} valid words.`);
-    return raw.trim().split(/\s+/).join(" ");
+    return normalizeMnemonic(raw);
   }
   const existing = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, "utf8") : "";
   if (lineFor(variable).test(existing)) throw new Error(`${ENV_PATH} has an empty ${variable} line. Delete it to have a new identity made, or fill it.`);
@@ -109,8 +112,8 @@ async function provenOnRest(account: RelayerAccount): Promise<boolean> {
 /** "ours", "none" or "other" for the identity's published ML-KEM key, read as the bot reads it (C15). */
 async function kemState(identity: Identity): Promise<"ours" | "none" | "other"> {
   try {
-    const key = await fetchKemKey(identity.evm);
-    return Buffer.from(key).equals(Buffer.from(identity.seal.mlkemPublicKey)) ? "ours" : "other";
+    const { kemPublicKey } = await fetchKemKey(identity.evm);
+    return Buffer.from(kemPublicKey).equals(Buffer.from(identity.seal.mlkemPublicKey)) ? "ours" : "other";
   } catch (error) {
     if (error instanceof KemKeyUnavailable && error.reason === "NOT_FOUND") return "none";
     throw error;
@@ -166,8 +169,9 @@ async function onboard(live: Live, name: string, variable: string): Promise<Iden
   return identity;
 }
 
+/** A request to one of our own handlers, carrying x-ava as our app does, so the cross-site check passes it. */
 function jsonRequest(url: string, body: unknown): Request {
-  return new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  return new Request(url, { method: "POST", headers: { "content-type": "application/json", "x-ava": "1" }, body: JSON.stringify(body) });
 }
 
 /** Relays one signed action through handleRelay and requires a successful receipt (C26). */
@@ -181,25 +185,29 @@ async function relayed(live: Live, label: string, body: RelayBody): Promise<Hex>
   return outcome.txHash;
 }
 
-/** Seals a fresh key for `epoch` to each member's on-chain ML-KEM key (C11, C15) and uploads it through handleUpload. */
-async function sealFresh(live: Live, boardRef: Hex, epoch: bigint, members: readonly Hex[]): Promise<{ epochKey: Uint8Array; hash: Hex; size: number }> {
-  const recipients = [];
-  for (const address of members) recipients.push({ address, kemPublicKey: await fetchKemKey(address) });
+/**
+ * Seals a fresh key for `epoch` to each member's on-chain ML-KEM key (C11, C15) and uploads it
+ * through handleUpload as an internal upload. The fresh key only seals: a pack is encrypted under
+ * the key checkedKey opens back from the chain once the envelope is recorded (C12).
+ */
+async function sealFresh(live: Live, boardRef: Hex, epoch: bigint, members: readonly Hex[]): Promise<{ epochKey: FreshEpochKey; hash: Hex; size: number }> {
+  const recipients: KemRecipient[] = [];
+  for (const address of members) recipients.push(await fetchKemKey(address));
   const epochKey = newEpochKey();
   const envelope = sealEpochKey({ registry: REGISTRY_ADDRESS, boardRef, epoch, epochKey, recipients });
-  const uploaded = await uploadEnvelope(envelope, { clientIp: CLIENT_IP, now: Date.now(), store: live.store, blobs: live.blobs, blobOrigin: live.env.BLOB_ORIGIN });
+  const uploaded = await uploadEnvelope(envelope, { clientIp: CLIENT_IP, now: Date.now(), store: live.store, blobs: live.blobs, blobOrigin: live.env.BLOB_ORIGIN, internal: "sweep" });
   return { epochKey, ...uploaded };
 }
 
 /** The current epoch's key as the chain records it, opened by the chair after the C12 check, and required to equal the key the seed holds. */
-async function checkedKey(live: Live, snapshot: BoardSnapshot, chair: Identity, held: Uint8Array): Promise<Uint8Array> {
+async function checkedKey(live: Live, snapshot: BoardSnapshot, chair: Identity, held: FreshEpochKey): Promise<OpenedEpochKey> {
   const opened = await openCurrentEpochKey({ snapshot, sealKeys: chair.seal, blobs: live.blobs, blobOrigin: live.env.BLOB_ORIGIN });
   if (!Buffer.from(opened).equals(Buffer.from(held))) throw new Error(`The epoch ${snapshot.epoch} envelope on chain does not carry the key the seed sealed. Stopping.`);
   return opened;
 }
 
 /** Encrypts one pack, stores it through the document token and verify path, then posts it. */
-async function postPack(live: Live, chair: Identity, snapshot: BoardSnapshot, epochKey: Uint8Array, n: number, story: string): Promise<void> {
+async function postPack(live: Live, chair: Identity, snapshot: BoardSnapshot, epochKey: OpenedEpochKey, n: number, story: string): Promise<void> {
   const text = `${LABEL}\n\nPack ${n} of 3. ${story}\n\nAgenda\n1. Welcome and roll call.\n2. How this pack stays private: it was encrypted before it left the chair's machine, and only members who hold the epoch ${snapshot.epoch} key can read it.\n3. Questions.\n\nNotes\nNo real company, figures or people appear on this board.\n`;
   const docRef = bytesToHex(newDocRef());
   const ciphertext = await encryptDocument({ epochKey, registry: REGISTRY_ADDRESS, boardRef: snapshot.boardRef, epoch: snapshot.epoch, docRef, plaintext: new TextEncoder().encode(text) });
@@ -345,16 +353,16 @@ async function main(): Promise<void> {
     const body = signedAction(chair, snapshot, { kind: "add", member: director.evm, mode: Mode.ROTATE, envelopeHash: next.hash, envelopeSize: next.size, epochAfter: snapshot.epoch + 1n });
     await relayed(live, `add ${director === asha ? "Asha" : "Ben"} (ROTATE to ${snapshot.epoch + 1n})`, body);
     snapshot = await chain.board(boardId);
-    next.epochKey = await checkedKey(live, snapshot, chair, next.epochKey);
+    const opened = await checkedKey(live, snapshot, chair, next.epochKey);
     if (director === ben) {
-      await postPack(live, chair, snapshot, next.epochKey, 1, `Posted in epoch ${snapshot.epoch}, when the board was the chair, Asha and Ben.`);
+      await postPack(live, chair, snapshot, opened, 1, `Posted in epoch ${snapshot.epoch}, when the board was the chair, Asha and Ben.`);
     }
   }
 
   snapshot = await chain.board(boardId);
   const current = await openCurrentEpochKey({ snapshot, sealKeys: chair.seal, blobs: live.blobs, blobOrigin: env.BLOB_ORIGIN });
-  const toChen = sealEpochKey({ registry: REGISTRY_ADDRESS, boardRef, epoch: snapshot.epoch, epochKey: current, recipients: [{ address: chen.evm, kemPublicKey: await fetchKemKey(chen.evm) }] });
-  const chenEnvelope = await uploadEnvelope(toChen, { clientIp: CLIENT_IP, now: Date.now(), store, blobs: live.blobs, blobOrigin: env.BLOB_ORIGIN });
+  const toChen = sealEpochKey({ registry: REGISTRY_ADDRESS, boardRef, epoch: snapshot.epoch, epochKey: current, recipients: [await fetchKemKey(chen.evm)] });
+  const chenEnvelope = await uploadEnvelope(toChen, { clientIp: CLIENT_IP, now: Date.now(), store, blobs: live.blobs, blobOrigin: env.BLOB_ORIGIN, internal: "sweep" });
   await relayed(
     live,
     `add Chen (SEAL_CURRENT ${snapshot.epoch})`,

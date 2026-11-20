@@ -4,17 +4,17 @@ import { parseEnv } from "node:util";
 import {
   Action,
   KemKeyUnavailable,
-  actionMessage,
+  canonicalPhrase,
   deadlineFrom,
   fetchKemKey,
   identityFromMnemonic,
   newEpochKey,
-  paramsRotate,
   sameAccount,
   sealEpochKey,
   sha256,
-  signAction,
+  signBoardAction,
   type Identity,
+  type KemRecipient,
 } from "@ava/core";
 import type { EvmWindow } from "@qorechain/evm";
 import { clearPqcStatusCache, fetchPqcStatus, isRegisteredPqcKey, withRetry } from "@qorechain/sdk";
@@ -54,7 +54,7 @@ async function provenKey(account: RelayerAccount): Promise<boolean> {
 }
 
 /** Only a dropped connection or a timeout is retried; every other KEM refusal stops at once (threat model C15). */
-async function kemKeyOf(address: string): Promise<Uint8Array> {
+async function kemKeyOf(address: string): Promise<KemRecipient> {
   return withRetry(() => fetchKemKey(address), {
     retries: 4,
     backoff: 2_000,
@@ -94,14 +94,23 @@ async function relayOneRotation(env: ServerEnv, relayer: RelayerAccount, chair: 
   const epochAfter = board.epoch + 1n;
   console.log(`board:     ${id}, chair ${board.chair}, epoch ${board.epoch}, nonce ${board.nonce}, ${members.length} members, read at block ${block.number}`);
 
-  const recipients = [];
-  for (const address of members) recipients.push({ address, kemPublicKey: await kemKeyOf(address) });
+  const recipients: KemRecipient[] = [];
+  for (const address of members) recipients.push(await kemKeyOf(address));
   const envelope = sealEpochKey({ registry: REGISTRY_ADDRESS, boardRef: board.boardRef, epoch: epochAfter, epochKey: newEpochKey(), recipients });
   const envelopeHash = bytesToHex(sha256(envelope));
   const deadline = deadlineFrom(block.timestamp, DEADLINE_SECONDS);
-  const paramsHash = paramsRotate({ envelopeHash, envelopeSize: envelope.length, epochAfter });
-  const message = actionMessage({ registry: REGISTRY_ADDRESS, action: Action.ROTATE, boardId: id, paramsHash, nonce: board.nonce, deadline });
-  const signature = bytesToHex(signAction(chair.mldsa.secretKey, message));
+  const signed = signBoardAction(chair.mldsa.secretKey, {
+    action: Action.ROTATE,
+    envelopeHash,
+    envelopeSize: envelope.length,
+    epochAfter,
+    registry: REGISTRY_ADDRESS,
+    boardId: id,
+    nonce: board.nonce,
+    deadline,
+    latestBlockTimestamp: block.timestamp,
+  });
+  const signature = bytesToHex(signed.signature);
   console.log(`signed:    ROTATE to epoch ${epochAfter} by the chair's ML-DSA-87 key over board nonce ${board.nonce}; envelope ${envelope.length} bytes, sha256 ${envelopeHash}`);
   console.log("           The envelope is not uploaded anywhere, so this test board's members cannot open the new epoch. Only the proof's test boards are used.");
 
@@ -112,7 +121,7 @@ async function relayOneRotation(env: ServerEnv, relayer: RelayerAccount, chair: 
     deadline: deadline.toString(),
     signature,
   };
-  const request = new Request("http://localhost/api/relay", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const request = new Request("http://localhost/api/relay", { method: "POST", headers: { "content-type": "application/json", "x-ava": "1" }, body: JSON.stringify(body) });
   const store = UpstashStore.connect({ url: env.UPSTASH_REDIS_REST_URL, token: env.UPSTASH_REDIS_REST_TOKEN });
   const response = await handleRelay(request, { clientIp: "127.0.0.1", now: Date.now(), store, relayer: publicAddress(relayer), chain: liveChain(relayer, client) });
   const answer = (await response.json()) as { txHash?: unknown; error?: unknown };
@@ -169,7 +178,7 @@ async function main(): Promise<void> {
   if (chairPhrase === undefined || chairPhrase.trim() === "") {
     missing.push(`PROVE_CHAIR_MNEMONIC is not in ${CONTRACTS_ENV}. Run the registry proof first.`);
   } else {
-    chair = await identityFromMnemonic(chairPhrase.trim().split(/\s+/).join(" "));
+    chair = await identityFromMnemonic(canonicalPhrase(chairPhrase));
     console.log(`chair:     ${chair.evm} (the registry proof's chair, read from packages/contracts/.env)`);
   }
 

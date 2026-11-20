@@ -1,7 +1,7 @@
-import { REST, accountBytes, toHex } from "@ava/core";
+import { REST, accountBytes, sameAccount, toHex } from "@ava/core";
 import type { Address } from "viem";
 import { z } from "zod";
-import { isRelayerMnemonic, normalizeMnemonic } from "./chain/account.ts";
+import { evmAddressOf, isRelayerMnemonic, normalizeMnemonic } from "./chain/account.ts";
 
 /**
  * Whether the value is exactly an https origin as the URL parser writes it: lowercase scheme and
@@ -88,15 +88,34 @@ const schema = z.object({
   UPSTASH_REDIS_REST_TOKEN: secret,
   BLOB_READ_WRITE_TOKEN: secret,
   BLOB_ORIGIN: z.preprocess(blankToUndefined, z.string().refine(isHttpsOrigin)),
-  REST_UPSTREAM: z.preprocess((value) => blankToUndefined(value) ?? REST, z.string().refine(isHttpsOrigin)),
+  // The proxy reaches this origin and no other (threat model C22), so only the testnet REST itself is accepted.
+  REST_UPSTREAM: z.preprocess((value) => blankToUndefined(value) ?? REST, z.string().refine((value) => isHttpsOrigin(value) && value === REST)),
   RELAYER_MNEMONIC: phrase(),
   SPONSOR_MNEMONIC: phrase(),
   DEMO_CHAIR_MNEMONIC: phrase(),
   // Optional until the demo board is seeded; the demo endpoints answer 503 not_ready without it.
   DEMO_BOARD_ID: boardId,
-  // The seeded directors, never removed by the guest sweep.
+  // The seeded directors, never removed by the guest sweep. Required whenever DEMO_BOARD_ID is set.
   DEMO_SEEDED: accountList,
 });
+
+const ROLE_PHRASES = ["RELAYER_MNEMONIC", "SPONSOR_MNEMONIC", "DEMO_CHAIR_MNEMONIC"] as const;
+
+/**
+ * The first two roles whose phrases derive one account (threat model C36: three separate accounts,
+ * each holding only what its job needs). Compares the derived 20 bytes, so the same phrase spaced
+ * or cased differently is still caught.
+ */
+function sharedRole(env: z.infer<typeof schema>): readonly [string, string] | undefined {
+  const roles = ROLE_PHRASES.flatMap((key) => {
+    const phrase = env[key];
+    return phrase === undefined ? [] : [{ key, account: evmAddressOf(phrase) }];
+  });
+  for (const [i, a] of roles.entries()) {
+    for (const b of roles.slice(i + 1)) if (sameAccount(a.account, b.account)) return [a.key, b.key];
+  }
+  return undefined;
+}
 
 export type ServerEnv = Readonly<z.infer<typeof schema>>;
 
@@ -108,17 +127,32 @@ export class EnvError extends Error {
   }
 }
 
+const HINT = "Each key is described in packages/server/.env.example.";
+
 /**
- * Reads and checks the server's settings once, at boot.
+ * Reads and checks the server's settings once, at boot. This is where the role accounts are first
+ * derived: each set phrase's 0x address is worked out here, so a server whose roles share an
+ * account never starts.
  *
  * @param source The environment to read, `process.env` by default.
- * @returns The settings, frozen. REST_UPSTREAM falls back to the QoreChain testnet REST.
- * @throws EnvError naming every missing or invalid key. Values are never echoed, because some of
- *   them are secrets.
+ * @returns The settings, frozen. REST_UPSTREAM falls back to the QoreChain testnet REST, the only
+ *   value it may hold.
+ * @throws EnvError naming every missing or invalid key; then, once each key is valid on its own,
+ *   naming DEMO_SEEDED when DEMO_BOARD_ID is set without it, or the two phrase keys when two of the
+ *   relayer, sponsor and demo chair phrases derive the same account. Values are never echoed,
+ *   because some of them are secrets.
  */
 export function loadEnv(source: Record<string, string | undefined> = process.env): ServerEnv {
   const parsed = schema.safeParse(source);
-  if (parsed.success) return Object.freeze(parsed.data);
+  if (parsed.success) {
+    const env = parsed.data;
+    if (env.DEMO_BOARD_ID !== undefined && env.DEMO_SEEDED === undefined) {
+      throw new EnvError(`Server settings missing DEMO_SEEDED: it is required whenever DEMO_BOARD_ID is set. ${HINT}`);
+    }
+    const shared = sharedRole(env);
+    if (shared !== undefined) throw new EnvError(`Server settings invalid ${shared.join(", ")}: both phrases derive the same account, and each role needs its own. ${HINT}`);
+    return Object.freeze(env);
+  }
   const keys = [...new Set(parsed.error.issues.map((issue) => String(issue.path[0] ?? "")))].filter(Boolean);
   const missing = keys.filter((key) => source[key] === undefined || source[key] === "");
   const invalid = keys.filter((key) => !missing.includes(key));
@@ -126,7 +160,7 @@ export function loadEnv(source: Record<string, string | undefined> = process.env
     missing.length > 0 ? `missing ${missing.join(", ")}` : "",
     invalid.length > 0 ? `invalid ${invalid.join(", ")}` : "",
   ].filter(Boolean);
-  throw new EnvError(`Server settings ${parts.join("; ")}. Each key is described in packages/server/.env.example.`);
+  throw new EnvError(`Server settings ${parts.join("; ")}. ${HINT}`);
 }
 
 type PhraseKey = "RELAYER_MNEMONIC" | "SPONSOR_MNEMONIC" | "DEMO_CHAIR_MNEMONIC";

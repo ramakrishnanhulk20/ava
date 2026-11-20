@@ -6,10 +6,11 @@ import { createHash } from "node:crypto";
 import { generateSealKeys, seal } from "@qorechain/qoreseal";
 import * as vercelBlob from "@vercel/blob";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryBlobBackend, UPLOAD_CAPS, VercelBlobBackend, handleUpload, type UploadContext } from "../src/blob.ts";
+import { INTERNAL_UPLOAD_LIMITS, MemoryBlobBackend, UPLOAD_CAPS, VercelBlobBackend, handleUpload, type UploadContext } from "../src/blob.ts";
+import { uploadEnvelope } from "../src/demoBoard.ts";
 import { TooLarge } from "../src/http.ts";
 import { MemoryStore } from "../src/store.ts";
-import { failingStore } from "./fixtures.ts";
+import { APP_HEADERS, CROSS_SITE_HEADERS, failingStore, stalledBody } from "./fixtures.ts";
 
 vi.mock("@vercel/blob", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@vercel/blob")>()),
@@ -39,8 +40,14 @@ function context(extra: Partial<UploadContext> = {}): UploadContext {
   return { clientIp: "203.0.113.7", now: Date.now(), store: new MemoryStore(), blobs: new MemoryBlobBackend(ORIGIN), blobOrigin: ORIGIN, ...extra };
 }
 
+/** An upload as our app sends it; `headers` adds to or replaces those headers. */
 function upload(kind: string, body: BodyInit | null, headers: Record<string, string> = {}): Request {
-  return new Request(`http://app.local/api/upload?kind=${kind}`, { method: "POST", body, headers, duplex: "half" } as RequestInit);
+  return new Request(`http://app.local/api/upload?kind=${kind}`, {
+    method: "POST",
+    body,
+    headers: { ...APP_HEADERS, "content-type": "application/octet-stream", ...headers },
+    duplex: "half",
+  } as RequestInit);
 }
 
 /**
@@ -70,6 +77,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("handleUpload", () => {
@@ -95,13 +103,12 @@ describe("handleUpload", () => {
     expect(Object.keys(UPLOAD_CAPS)).toEqual(["envelope"]);
   });
 
-  it("ignores a client name and content type, and refuses any query but kind", async () => {
+  it("ignores a client name and path, and refuses any query but kind", async () => {
     const ctx = context();
     const put = vi.spyOn(ctx.blobs, "put");
     const bytes = envelopeOf(2);
     const response = await handleUpload(
       upload("envelope", bytes, {
-        "content-type": "text/html",
         "content-disposition": 'inline; filename="../../index.html"',
         "x-vercel-blob-pathname": "index.html",
         "x-filename": "evil.svg",
@@ -114,8 +121,9 @@ describe("handleUpload", () => {
     for (const query of ["envelope&name=evil.html", "document", "other", "envelope&kind=document", "Envelope", "%65nvelope"]) {
       expect((await handleUpload(upload(query, bytes), ctx)).status).toBe(400);
     }
-    expect((await handleUpload(new Request("http://app.local/api/upload", { method: "POST", body: bytes }), ctx)).status).toBe(400);
-    expect((await handleUpload(new Request("http://app.local/api/upload?kind=envelope"), ctx)).status).toBe(405);
+    const octet = { ...APP_HEADERS, "content-type": "application/octet-stream" };
+    expect((await handleUpload(new Request("http://app.local/api/upload", { method: "POST", body: bytes, headers: octet }), ctx)).status).toBe(400);
+    expect((await handleUpload(new Request("http://app.local/api/upload?kind=envelope", { headers: APP_HEADERS }), ctx)).status).toBe(405);
     expect(put).toHaveBeenCalledTimes(1);
   });
 
@@ -204,10 +212,84 @@ describe("handleUpload", () => {
     expect(budgetPut).toHaveBeenCalledTimes(1);
   });
 
+  it("counts the server's own uploads on a daily budget per scope, never against the anonymous limits", async () => {
+    const ctx = context({ limits: { perIp: 1, total: 1, windowSeconds: 3600, bytesPerIp: 2_000 } });
+    expect((await handleUpload(upload("envelope", envelopeOf(50)), ctx)).status).toBe(201);
+    expect((await handleUpload(upload("envelope", envelopeOf(51)), { ...ctx, clientIp: "203.0.113.8" })).status).toBe(429);
+
+    const bot: UploadContext = { ...ctx, internal: "demo-bot" };
+    const envelope = envelopeOf(52);
+    expect(await uploadEnvelope(envelope, bot)).toEqual({ hash: `0x${hexOf(envelope)}`, size: 1_700 });
+    for (let i = 1; i < INTERNAL_UPLOAD_LIMITS.perDay; i++) await uploadEnvelope(envelope, bot);
+    await expect(uploadEnvelope(envelope, bot)).rejects.toMatchObject({ status: 429, reason: "upload_failed" });
+    expect(await uploadEnvelope(envelopeOf(53), { ...ctx, internal: "sweep" })).toMatchObject({ size: 1_700 });
+
+    // The bot spent nothing of the anonymous limits, and they still hold for everyone else.
+    expect((await handleUpload(upload("envelope", envelopeOf(54)), { ...ctx, clientIp: "203.0.113.9" })).status).toBe(429);
+    expect(await ctx.store.get("rate:upload:ip:203.0.113.7")).toBe("1");
+    expect(INTERNAL_UPLOAD_LIMITS).toEqual({ perDay: 600 });
+    const unknown = await handleUpload(upload("envelope", envelopeOf(55)), { ...ctx, internal: "admin" as never });
+    expect(unknown.status).toBe(500);
+  });
+
+  it("gives up on a body that has not ended after 20 seconds with 408, and stores nothing", async () => {
+    vi.useFakeTimers();
+    const ctx = context();
+    const put = vi.spyOn(ctx.blobs, "put");
+    const body = stalledBody();
+    const pending = handleUpload(upload("envelope", body.stream), ctx);
+    let settled = false;
+    void pending.then(() => (settled = true));
+    for (let i = 0; i < 1_000 && !body.waiting(); i++) await Promise.resolve();
+    expect(body.waiting()).toBe(true);
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const response = await pending;
+    expect(response.status).toBe(408);
+    expect(await response.json()).toEqual({ error: "body_timeout" });
+    expect(put).not.toHaveBeenCalled();
+  });
+
   it("fails closed when the shared store is down", async () => {
     const ctx = context({ store: failingStore() });
     const put = vi.spyOn(ctx.blobs, "put");
     expect((await handleUpload(upload("envelope", new Uint8Array(10)), ctx)).status).toBe(429);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 403 what a cross-site page can send, before it counts, reads the body or reaches the store", async () => {
+    const ctx = context();
+    const touched = [vi.spyOn(ctx.store, "incrWindow"), vi.spyOn(ctx.store, "get"), vi.spyOn(ctx.blobs, "exists"), vi.spyOn(ctx.blobs, "put")];
+    for (const headers of CROSS_SITE_HEADERS) {
+      const { stream, counter } = countingStream(1_024);
+      const request = new Request("http://app.local/api/upload?kind=envelope", {
+        method: "POST",
+        body: stream,
+        headers: { "content-type": "application/octet-stream", ...headers },
+        duplex: "half",
+      } as RequestInit);
+      const response = await handleUpload(request, ctx);
+      expect({ headers, status: response.status }).toEqual({ headers, status: 403 });
+      expect(await response.json()).toEqual({ error: "cross_site" });
+      expect(counter.pulled).toBe(0);
+    }
+    for (const spy of touched) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 415 any content type but exactly application/octet-stream, and counts nothing", async () => {
+    const ctx = context();
+    const counted = vi.spyOn(ctx.store, "incrWindow");
+    const put = vi.spyOn(ctx.blobs, "put");
+    for (const contentType of ["text/plain", "text/plain;charset=UTF-8", "application/x-www-form-urlencoded", "multipart/form-data", "application/octet-stream; charset=utf-8", undefined]) {
+      const headers: Record<string, string> = { "x-ava": "1", "sec-fetch-site": "same-origin", ...(contentType === undefined ? {} : { "content-type": contentType }) };
+      const request = new Request("http://app.local/api/upload?kind=envelope", { method: "POST", body: envelopeOf(40), headers });
+      const response = await handleUpload(request, ctx);
+      expect({ contentType, status: response.status }).toEqual({ contentType, status: 415 });
+      expect(await response.json()).toEqual({ error: "content_type" });
+      expect(request.bodyUsed).toBe(false);
+    }
+    expect(counted).not.toHaveBeenCalled();
     expect(put).not.toHaveBeenCalled();
   });
 });

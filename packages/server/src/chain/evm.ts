@@ -2,6 +2,8 @@ import { sameAccount } from "@ava/core";
 import {
   BaseError,
   ExecutionRevertedError,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   createPublicClient,
   defineChain,
   http,
@@ -55,6 +57,15 @@ export interface EvmSend {
   maxPriorityFeePerGas: bigint;
 }
 
+/** What a receipt says one transaction cost: the gas it used and the price per gas it paid, in wei. */
+export interface ReceiptFee {
+  gasUsed: bigint;
+  effectiveGasPrice: bigint;
+}
+
+/** Blocks are about 1.4 s, so a receipt is looked for about once a block. */
+const RECEIPT_POLL_MS = 1_000;
+
 /**
  * eth_call of one exact transaction at the latest block. A revert comes back as an outcome with its
  * raw revert data; anything else (a network failure, a node error) is thrown, so a refusal is never
@@ -90,21 +101,69 @@ export async function pendingNonce(client: PublicClient, address: Hex): Promise<
   return client.getTransactionCount({ address, blockTag: "pending" });
 }
 
+/** A send that stopped before anything was handed to the node: no transaction exists and no nonce was used. */
+export class NotBroadcast extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotBroadcast";
+  }
+}
+
+/**
+ * One transaction the relayer signed, as known from its signed bytes before any broadcast: its lane,
+ * the account nonce (EVM) or sequence (native) it carries, and its hash. EVM hashes are 0x and
+ * lowercase; native hashes are 64 uppercase hex digits, as the chain's REST names them.
+ */
+export interface SignedTx {
+  kind: "evm" | "native";
+  nonce: bigint;
+  hash: string;
+}
+
+/**
+ * Runs after signing and before the broadcast. When it throws, the transaction is never handed to
+ * the node and the send throws NotBroadcast.
+ */
+export type BeforeBroadcast = (signed: SignedTx) => Promise<void>;
+
+/**
+ * Where one of the relayer's own transactions stands: in a block ("landed", or "reverted" when its
+ * receipt says it reverted), waiting in a node's pool, or unknown to the chain. Both "landed" and
+ * "reverted" used the account's nonce; only "landed" can have changed the registry. "landed" also
+ * covers a transaction in a block whose receipt was not there to read, so it is never a guess at
+ * success. Native transactions answer "landed" whatever their result code.
+ */
+export type TxStatus = "landed" | "reverted" | "pending" | "unknown";
+
 /**
  * Signs one EIP-1559 transaction locally with the relayer's secp256k1 key (value 0, chain id 9800,
  * the pending nonce) and broadcasts it once. The hash is known before sending, so a lost answer is
  * met by looking the hash up until the deadline, never by sending again. Does not wait for the receipt.
  *
+ * @param beforeBroadcast Given the nonce and hash once signed, before the broadcast (threat model
+ *   C24). If it throws, nothing is sent.
  * @returns The transaction hash, once the node has taken it.
- * @throws When the key is not the relayer's, or the node refused the transaction and it is not
- *   seen before the deadline.
+ * @throws NotBroadcast when the key is not the relayer's, the nonce read or the signing failed, or
+ *   beforeBroadcast threw, so nothing was sent. An Error when the node refused the transaction and
+ *   it is not seen before the deadline: it was handed over, so it may still land.
  */
-export async function sendEvm(client: PublicClient, account: RelayerAccount, tx: EvmSend, deadline: Deadline): Promise<Hex> {
+export async function sendEvm(client: PublicClient, account: RelayerAccount, tx: EvmSend, deadline: Deadline, beforeBroadcast?: BeforeBroadcast): Promise<Hex> {
   const signer = privateKeyToAccount(account.privateKey);
-  if (!sameAccount(signer.address, account.evm)) throw new Error("The EVM signing key is not the relayer's key.");
-  const nonce = await pendingNonce(client, account.evm);
-  const serialized = await signer.signTransaction({ type: "eip1559", chainId: EVM_CHAIN_ID, nonce, value: 0n, ...tx });
+  if (!sameAccount(signer.address, account.evm)) throw new NotBroadcast("The EVM signing key is not the relayer's key.");
+  let serialized: Hex;
+  let nonce: number;
+  try {
+    nonce = await pendingNonce(client, account.evm);
+    serialized = await signer.signTransaction({ type: "eip1559", chainId: EVM_CHAIN_ID, nonce, value: 0n, ...tx });
+  } catch {
+    throw new NotBroadcast("The EVM transaction could not be prepared: nothing was sent.");
+  }
   const hash = keccak256(serialized);
+  try {
+    await beforeBroadcast?.({ kind: "evm", nonce: BigInt(nonce), hash });
+  } catch {
+    throw new NotBroadcast("The EVM transaction could not be recorded before its broadcast: nothing was sent.");
+  }
   try {
     await client.sendRawTransaction({ serializedTransaction: serialized });
   } catch {
@@ -122,6 +181,51 @@ async function seenBefore(client: PublicClient, hash: Hex, deadline: Deadline): 
     await pause(Math.min(1_000, leftMs(deadline)));
   }
   return false;
+}
+
+/**
+ * The receipt of `hash`, looked up until it is found or the deadline passes. A receipt that names
+ * another transaction is treated as none.
+ *
+ * @returns The gas used and effective gas price, or undefined when no receipt was seen in time.
+ */
+export async function receiptFee(client: PublicClient, hash: Hex, deadline: Deadline): Promise<ReceiptFee | undefined> {
+  while (leftMs(deadline) > 0) {
+    const receipt = await within(deadline, client.getTransactionReceipt({ hash }), "the receipt lookup").catch(() => undefined);
+    if (receipt !== undefined) {
+      if (receipt.transactionHash.toLowerCase() !== hash.toLowerCase()) return undefined;
+      return { gasUsed: receipt.gasUsed, effectiveGasPrice: receipt.effectiveGasPrice };
+    }
+    await pause(Math.min(RECEIPT_POLL_MS, leftMs(deadline)));
+  }
+  return undefined;
+}
+
+/**
+ * Where the relayer's EVM transaction `hash` stands on the node: "reverted" when its receipt's
+ * status (as viem reads it) says it reverted, "landed" for any other receipt or a block number
+ * with no receipt yet, "pending" while the node holds it unmined, "unknown" when the node knows
+ * neither. An answer that names another transaction is thrown, like any failed lookup, so a caller
+ * never reads "unknown" or "reverted" from a lookup that did not run.
+ */
+export async function evmTxStatus(client: PublicClient, hash: string): Promise<TxStatus> {
+  if (!/^0x[0-9a-f]{64}$/.test(hash)) throw new Error("An EVM transaction hash is 0x and 64 lowercase hex digits.");
+  const wanted = hash as Hex;
+  try {
+    const receipt = await client.getTransactionReceipt({ hash: wanted });
+    if (receipt.transactionHash.toLowerCase() !== wanted) throw new Error("The receipt names another transaction.");
+    return receipt.status === "reverted" ? "reverted" : "landed";
+  } catch (error) {
+    if (!(error instanceof TransactionReceiptNotFoundError)) throw error;
+  }
+  try {
+    const found = await client.getTransaction({ hash: wanted });
+    if (found.hash.toLowerCase() !== wanted) throw new Error("The node answered with another transaction.");
+    return found.blockNumber === null ? "pending" : "landed";
+  } catch (error) {
+    if (error instanceof TransactionNotFoundError) return "unknown";
+    throw error;
+  }
 }
 
 /** keccak256 of the code at `address`, or undefined when there is none. */

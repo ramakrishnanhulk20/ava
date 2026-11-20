@@ -12,7 +12,7 @@ import {
   type ProxyContext,
 } from "../src/proxy.ts";
 import { MemoryStore } from "../src/store.ts";
-import { failingStore } from "./fixtures.ts";
+import { APP_HEADERS, CROSS_SITE_HEADERS, failingStore, stalledBody } from "./fixtures.ts";
 
 const UPSTREAM = "https://api-testnet.qore.host";
 const MOUNT = "/api/chain";
@@ -40,12 +40,13 @@ function context(fetch: typeof globalThis.fetch, extra: Partial<ProxyContext> = 
   return { clientIp: "203.0.113.7", now: Date.now(), store: new MemoryStore(), upstream: UPSTREAM, mount: MOUNT, fetch, ...extra };
 }
 
-function get(path: string, headers?: Record<string, string>): Request {
-  return new Request(`http://app.local${MOUNT}${path}`, { headers });
+/** Requests as our app sends them: every one carries the app's own headers. */
+function get(path: string, headers: Record<string, string> = {}): Request {
+  return new Request(`http://app.local${MOUNT}${path}`, { headers: { ...APP_HEADERS, ...headers } });
 }
 
 function post(path: string, body: string, contentType = "application/json"): Request {
-  return new Request(`http://app.local${MOUNT}${path}`, { method: "POST", body, headers: { "content-type": contentType } });
+  return new Request(`http://app.local${MOUNT}${path}`, { method: "POST", body, headers: { ...APP_HEADERS, "content-type": contentType } });
 }
 
 beforeEach(() => {
@@ -266,12 +267,59 @@ describe("handleChainPost", () => {
       [post("/cosmos/tx/v1beta1/txs", JSON.stringify({ tx_bytes: TX_BYTES })), 400],
       [post("/cosmos/tx/v1beta1/txs", sync({ extra: 1 })), 400],
       [post("/cosmos/tx/v1beta1/simulate", JSON.stringify({ tx_bytes: "not base64!" })), 400],
-      [new Request(`http://app.local${MOUNT}/cosmos/tx/v1beta1/txs`), 405],
+      [new Request(`http://app.local${MOUNT}/cosmos/tx/v1beta1/txs`, { headers: APP_HEADERS }), 405],
     ];
     for (const [request, status] of cases) {
       expect({ url: request.url, status: (await handleChainPost(request, ctx)).status }).toEqual({ url: request.url, status });
     }
     expect((await handleChainGet(post("/cosmos/tx/v1beta1/txs", sync()), ctx)).status).toBe(405);
+    expect(upstream.calls()).toBe(0);
+  });
+});
+
+describe("request bodies", () => {
+  it("that have not ended after 20 seconds are refused with 408, unsent", async () => {
+    vi.useFakeTimers();
+    const upstream = stubFetch();
+    const body = stalledBody();
+    const request = new Request(`http://app.local${MOUNT}/cosmos/tx/v1beta1/txs`, {
+      method: "POST",
+      headers: { ...APP_HEADERS, "content-type": "application/json" },
+      body: body.stream,
+      duplex: "half",
+    } as RequestInit);
+    const pending = handleChainPost(request, context(upstream.fetch));
+    let settled = false;
+    void pending.then(() => (settled = true));
+    for (let i = 0; i < 1_000 && !body.waiting(); i++) await Promise.resolve();
+    expect(body.waiting()).toBe(true);
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const response = await pending;
+    expect(response.status).toBe(408);
+    expect(await response.json()).toEqual({ error: "body_timeout" });
+    expect(upstream.calls()).toBe(0);
+  });
+});
+
+describe("cross-site requests", () => {
+  it("are refused with 403 on GET and POST, before anything is counted, read or sent upstream", async () => {
+    const upstream = stubFetch();
+    const ctx = context(upstream.fetch);
+    const counted = vi.spyOn(ctx.store, "incrWindow");
+    const body = JSON.stringify({ tx_bytes: TX_BYTES, mode: "BROADCAST_MODE_SYNC" });
+    for (const headers of CROSS_SITE_HEADERS) {
+      const read = await handleChainGet(new Request(`http://app.local${MOUNT}/cosmos/base/tendermint/v1beta1/node_info`, { headers }), ctx);
+      expect({ headers, status: read.status }).toEqual({ headers, status: 403 });
+      expect(await read.json()).toEqual({ error: "cross_site" });
+      const request = new Request(`http://app.local${MOUNT}/cosmos/tx/v1beta1/txs`, { method: "POST", body, headers: { "content-type": "application/json", ...headers } });
+      const write = await handleChainPost(request, ctx);
+      expect({ headers, status: write.status }).toEqual({ headers, status: 403 });
+      expect(await write.json()).toEqual({ error: "cross_site" });
+      expect(request.bodyUsed).toBe(false);
+    }
+    expect(counted).not.toHaveBeenCalled();
     expect(upstream.calls()).toBe(0);
   });
 });

@@ -37,11 +37,34 @@ export const MAX_GAS_CEILING = 650_000n;
 export const MAX_FEE_PER_GAS = 250_000_000_000n;
 
 /**
- * 8 QOR a day (UTC), in uqor: the most the relayer may lose in a day, sized for judging-day volume
- * (each guest admission is one addMember). The ledger counts window opens and closes and the worst
- * case of every relayed transaction, and no window is ever allowed more value than is left of it.
+ * 20 QOR a day (UTC), in uqor: the most the relayer may lose in a day, all traffic together (threat
+ * model C24, C25). It counts window opens and closes and every relayed transaction, and no window is
+ * ever given more value than is left of it, so a leaked classical key can burn at most what is left.
+ * A transaction is booked at its worst case (gas ceiling times fee cap) before it is sent and
+ * settled down to its receipt's real fee after; one with no receipt keeps its worst case. The two
+ * shares below add up to this ceiling, and window fees come out of it too, so the shares are
+ * limits on each kind of traffic, never a promise that both can be spent in full on one day.
  */
-export const DAILY_SPEND_CEILING_UQOR = 8_000_000n;
+export const RELAYER_DAILY_CEILING_UQOR = 20_000_000n;
+/** The earlier name of RELAYER_DAILY_CEILING_UQOR, kept so older imports still read the one total. */
+export const DAILY_SPEND_CEILING_UQOR = RELAYER_DAILY_CEILING_UQOR;
+
+/**
+ * 8 QOR a day of public chair relays, all chairs together (C41): the demo bot's traffic can never
+ * spend it, so judges acting on their own boards are served whatever the demo board does. At the
+ * real fees measured on 17 Nov (an addMember about 0.04 QOR) that is some 200 actions a day.
+ */
+export const CHAIRS_DAILY_CEILING_UQOR = 8_000_000n;
+
+/** 12 QOR a day of the demo bot's relays (C41), its own share, so the chairs' traffic cannot starve it either. */
+export const DEMO_DAILY_CEILING_UQOR = 12_000_000n;
+
+/**
+ * 1.5 QOR a day for one chair address, public relays only, so no single chair can spend the chairs'
+ * share for everyone (C40, C41). About 37 actions at today's real fees, and still 11 creates if
+ * every receipt were lost and each stayed at its worst case of 0.13 QOR.
+ */
+export const PER_CHAIR_DAILY_UQOR = 1_500_000n;
 
 /**
  * Relay requests per hour (threat model C23, C24, C40). Every request counts against its IP. Only an
@@ -50,6 +73,42 @@ export const DAILY_SPEND_CEILING_UQOR = 8_000_000n;
  * chair's budget. Each rejected request costs one eth_call, and 3,000 an hour is under one a second.
  */
 export const RELAY_LIMITS = { perIp: 20, perChair: 60, perBoard: 60, total: 600, rejected: 3000, windowSeconds: 3600 } as const;
+
+/**
+ * The demo bot's own relays per clock hour (threat model C41): 120, room for 60 guests an hour to be
+ * admitted and later removed, one relay each. The bot reserves each relay just before it makes it,
+ * and its relays count against none of RELAY_LIMITS, so public traffic cannot use this room.
+ */
+export const DEMO_RELAYS_PER_HOUR = 120;
+
+/**
+ * Bytes of documents one chair may post in a UTC day (threat model C44): 100 MiB, four documents at
+ * the registry's 25 MiB cap per document. Every posted document is kept for good at our cost, so a
+ * post is budgeted by the bytes it makes permanent, not only by the fee it burns; the chairs' 8 QOR
+ * a day would otherwise buy some 5 GiB of permanent storage a day.
+ */
+export const PER_CHAIR_DAILY_POST_BYTES = 104_857_600n;
+/** Bytes of documents all chairs together may post in a UTC day (C44): 1 GiB, forty documents at the 25 MiB cap, kept for good. */
+export const TOTAL_DAILY_POST_BYTES = 1_073_741_824n;
+
+/**
+ * Bytes of document upload tokens one client may be issued in a UTC day (threat model C28, C44):
+ * 25 MiB, one full-size board pack at the registry's cap. Every document that is posted is kept for
+ * good, whoever sends the post: the relay's post bytes budget sees only posts it relays, and a chair
+ * can post from its own account. So the bytes are budgeted where they enter the store: each token
+ * allows exactly the size its request states, that size is booked before the token is issued, and
+ * a token whose upload never arrived gives it back once it can no longer be used.
+ */
+export const DOC_BYTES_PER_CLIENT_DAY = 26_214_400;
+/** Every /64 of one IPv6 /48 shares four times a client's day, the factor every per-IP count here uses for a /48. */
+export const DOC_BYTES_PER_NET48_DAY = 4 * DOC_BYTES_PER_CLIENT_DAY;
+/**
+ * Bytes of document upload tokens all clients together may be issued in a UTC day (C44): fifty
+ * clients' days, 1,250 MiB. The runbook's rule for every shared total: only an attacker with 50 or
+ * more addresses can spend it and stop everyone else's uploads (docs/security/runbook.md, Known
+ * limits). At 100 MiB a client and 1 GiB in all, eleven addresses could.
+ */
+export const DOC_BYTES_TOTAL_DAY = 50 * DOC_BYTES_PER_CLIENT_DAY;
 
 /** 16 KiB. A relay body is about 9.5 KB: the 4,627-byte signature as hex plus a few short fields. */
 export const RELAY_BODY_CAP = 16_384;
@@ -108,6 +167,30 @@ export const OPEN_CUTOFF_MS = 20_000;
 export const LOCK_TTL_SECONDS = 60;
 export const SEND_LOCK_WAIT_MS = 20_000;
 export const WINDOW_LOCK_WAIT_MS = 5_000;
+/**
+ * How long a relay waits for its own receipt after the send, outside the send lock, so the day's
+ * ledgers can be settled to the real fee. About ten blocks; a receipt not seen by then, or by the
+ * relay's deadline, leaves the worst case booked.
+ */
+export const RECEIPT_WAIT_MS = 15_000;
+
+/**
+ * How long a nonce check waits for the relayer's own earlier transactions to reach a block before it
+ * decides (threat model C24): 10 s, about seven blocks, looked up once a second. The relay right
+ * after a send usually finds that send still waiting, so it waits about a block. One of ours still
+ * waiting after this is refused for now and asked about again by the next relay; a recorded hash the
+ * chain does not know after this is someone else's use of the nonce, and halts. A send never starts
+ * after SEND_CUTOFF_MS whatever this wait took.
+ */
+export const NONCE_CONFIRM_WAIT_MS = 10_000;
+export const NONCE_CONFIRM_POLL_MS = 1_000;
+
+/**
+ * The widest gap between the chain's nonce and the stored one that can still be all ours. Each
+ * check confirms every one of ours before anything new is signed, and one pass under the send lock
+ * signs at most a close, an open and a send, so a wider gap halts without a lookup per nonce.
+ */
+export const NONCE_GAP_CAP = 8n;
 
 /**
  * What the sponsor sends a new identity, once (threat model C27): 0.25 QOR. Registering its ML-DSA-87
@@ -147,12 +230,23 @@ export const SPONSOR_LOCK_WAIT_MS = 20_000;
 
 /** Members the demo board may hold in total, chair and seeded directors included (C34), below MAX_MEMBERS. */
 export const DEMO_GUEST_CAP = 40;
+/**
+ * Seats the background pressure pass keeps free below DEMO_GUEST_CAP (C41): six joins can land
+ * between background passes before a judge waits; each pass restores them.
+ */
+export const DEMO_FREE_SEATS = 6;
 /** A guest is removed six hours after admission. */
 export const DEMO_GUEST_TTL_SECONDS = 6 * 3600;
 /** A guest challenge lives five minutes. */
 export const DEMO_CHALLENGE_SECONDS = 300;
-/** Demo joins (C34): 3 per IP per hour, 200 in total per UTC day. */
-export const DEMO_JOIN_LIMITS = { perIp: 3, windowSeconds: 3600, perDay: 200 } as const;
+/**
+ * Demo joins (C34): 3 per IP per hour, 120 in total per UTC day. A join is one addMember (at most
+ * 373,334 gas measured, GAS_CEILING.add / 1.5), and each guest it seats is later removed by one
+ * removeMember (at most 300,000 gas), so about 673,000 gas a guest, 0.068 QOR at the 101 gwei the
+ * testnet charges today. 120 guests are 8.16 QOR, inside DEMO_DAILY_CEILING_UQOR's 12 QOR with
+ * 3.84 QOR to spare.
+ */
+export const DEMO_JOIN_LIMITS = { perIp: 3, windowSeconds: 3600, perDay: 120 } as const;
 /**
  * Challenge requests (C23), per IP and in total, per hour. Each one writes one five-minute record.
  * The total is 100 times the per-IP limit, so only an attacker with 100 or more addresses can reach

@@ -3,7 +3,8 @@
 // checked in the live runs. Lock expiry while fn is still running is a stated limit, not tested.
 import { Redis, type Requester } from "@upstash/redis";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LockBusy, MemoryStore, StoreReplyError, UpstashStore } from "../src/store.ts";
+import { LockBusy, MemoryStore, StoreReplyError, UpstashStore, claimOnce } from "../src/store.ts";
+import { retriedWrites } from "./fixtures.ts";
 
 function clock(start = 1_000_000) {
   let now = start;
@@ -49,6 +50,31 @@ describe("MemoryStore", () => {
     await expect(store.delete("")).rejects.toBeInstanceOf(TypeError);
   });
 
+  it("compares and sets: from absent, from the matching value, never from another value, and with a fresh lifetime", async () => {
+    const time = clock();
+    const store = new MemoryStore({ now: time.now });
+    expect(await store.compareAndSet("cursor", null, "10", 60)).toBe(true);
+    expect(await store.compareAndSet("cursor", null, "11", 60)).toBe(false);
+    expect(await store.compareAndSet("cursor", "10", "20", 60)).toBe(true);
+    expect(await store.compareAndSet("cursor", "10", "30", 60)).toBe(false);
+    expect(await store.get("cursor")).toBe("20");
+
+    time.advance(59_999);
+    expect(await store.compareAndSet("cursor", "20", "21", 60)).toBe(true);
+    time.advance(59_999);
+    expect(await store.get("cursor")).toBe("21");
+    time.advance(1);
+    expect(await store.get("cursor")).toBeNull();
+    expect(await store.compareAndSet("cursor", "21", "22", 60)).toBe(false);
+    expect(await store.compareAndSet("cursor", null, "", 60)).toBe(true);
+    expect(await store.compareAndSet("cursor", null, "x", 60)).toBe(false);
+    expect(await store.compareAndSet("cursor", "", "x", 60)).toBe(true);
+
+    await expect(store.compareAndSet("", null, "a", 60)).rejects.toBeInstanceOf(TypeError);
+    await expect(store.compareAndSet("k", null, "a", 0)).rejects.toBeInstanceOf(TypeError);
+    await expect(store.compareAndSet("k", 1 as never, "a", 60)).rejects.toBeInstanceOf(TypeError);
+  });
+
   it("refuses a second holder, releases after fn even when it throws", async () => {
     const store = new MemoryStore();
     const second = vi.fn(async () => "ran");
@@ -81,6 +107,20 @@ describe("MemoryStore", () => {
   it("refuses to construct when NODE_ENV is production", () => {
     vi.stubEnv("NODE_ENV", "production");
     expect(() => new MemoryStore()).toThrow(/tests only/);
+  });
+});
+
+describe("claimOnce", () => {
+  it("counts a write retried after its reply was lost as the caller's own, and never another caller's value", async () => {
+    const store = new MemoryStore();
+    const retried = retriedWrites(store, (write) => write === "setIfAbsent");
+    expect(await retried.setIfAbsent("mark", "mine", 60)).toBe(false);
+    expect(await store.get("mark")).toBe("mine");
+
+    expect(await claimOnce(retried, "claimed", "a:1", 60)).toBe(true);
+    expect(await claimOnce(retried, "claimed", "b:2", 60)).toBe(false);
+    expect(await claimOnce(store, "claimed", "a:1", 60)).toBe(true);
+    expect(await store.get("claimed")).toBe("a:1");
   });
 });
 
@@ -140,6 +180,47 @@ describe("UpstashStore", () => {
     expect(release?.[0]).toBe("eval");
     expect(String(release?.[1])).toContain('redis.call("get", KEYS[1]) == ARGV[1]');
     expect(release?.slice(2)).toEqual([1, "lock:queue", acquire?.[2]]);
+  });
+
+  it("compares and sets in one EVAL that reads, compares and writes with its lifetime", async () => {
+    let reply: unknown = 1;
+    const { store, sent } = recordingUpstash(() => reply);
+    expect(await store.compareAndSet("envsweep:next-block", "10", "20", 600)).toBe(true);
+    expect(await store.compareAndSet("envsweep:next-block", null, "10", 600)).toBe(true);
+    reply = 0;
+    expect(await store.compareAndSet("envsweep:next-block", "10", "20", 600)).toBe(false);
+    const [fromValue, fromAbsent] = sent.map((entry) => entry.body as unknown[]);
+    expect(sent).toHaveLength(3);
+    expect(fromValue?.[0]).toBe("eval");
+    expect(String(fromValue?.[1])).toMatch(/redis\.call\("get", KEYS\[1\]\)[\s\S]*redis\.call\("set", KEYS\[1\], ARGV\[3\], "EX", ARGV\[4\]\)/);
+    expect(fromValue?.slice(2)).toEqual([1, "envsweep:next-block", "value", "10", "20", "600"]);
+    expect(fromAbsent?.slice(2)).toEqual([1, "envsweep:next-block", "absent", "", "10", "600"]);
+    reply = "OK";
+    await expect(store.compareAndSet("envsweep:next-block", "10", "20", 600)).rejects.toBeInstanceOf(StoreReplyError);
+  });
+
+  it("takes a lock whose SET NX landed but answered no, as a request retried after a lost reply does, runs fn once and releases it", async () => {
+    const held = new Map<string, string>();
+    const { store } = recordingUpstash((command) => {
+      const [name, key, value] = command.map(String) as [string, string, string];
+      if (name === "set") {
+        if (!held.has(key)) held.set(key, value);
+        return null;
+      }
+      if (name === "get") return held.get(key) ?? null;
+      const [, , , releaseKey, token] = command.map(String);
+      if (name === "eval" && releaseKey !== undefined && held.get(releaseKey) === token) return Number(held.delete(releaseKey));
+      return 0;
+    });
+    const fn = vi.fn(async () => "ran");
+    expect(await store.withLock("queue", 30, fn)).toBe("ran");
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(held.has("lock:queue")).toBe(false);
+
+    held.set("lock:queue", "another-holder");
+    await expect(store.withLock("queue", 30, fn)).rejects.toBeInstanceOf(LockBusy);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(held.get("lock:queue")).toBe("another-holder");
   });
 
   it("does not run fn when the lock is held, and refuses a malformed reply", async () => {

@@ -1,10 +1,10 @@
 import { getJson, postJsonRpc } from "@qorechain/sdk";
 import type { PublicClient } from "viem";
-import { CHAIN_ID, EVM_CHAIN_ID, EVM_RPC, HTTP, RPC, WINDOW_CLOSE_FEE, WINDOW_OPEN_FEE } from "../config.ts";
+import { CHAIN_ID, EVM_CHAIN_ID, EVM_RPC, HTTP, REGISTRY_ADDRESS, RPC, WINDOW_CLOSE_FEE, WINDOW_OPEN_FEE } from "../config.ts";
 import { publicAddress, relayerFromMnemonic, type RelayerAccount, type RelayerAddress } from "./account.ts";
 import { OutOfTime, leftMs, pause, within, type Deadline } from "./deadline.ts";
-import { estimateGas, ethCall, evmClient, feeQuote, pendingNonce, sendEvm } from "./evm.ts";
-import { accountSequence, closeWindowTx, openWindowTx, readEvmWindow } from "./native.ts";
+import { codeKeccak, estimateGas, ethCall, evmClient, evmTxStatus, feeQuote, pendingNonce, receiptFee, sendEvm } from "./evm.ts";
+import { accountSequence, closeWindowTx, nativeTxStatus, openWindowTx, readEvmWindow } from "./native.ts";
 import type { RelayChain } from "./types.ts";
 
 const SEQUENCE_PAUSE_MS = 1_500;
@@ -26,6 +26,18 @@ async function waitForQuietNonce(client: PublicClient, account: RelayerAccount, 
 }
 
 /**
+ * The account's next nonce: the larger of the EVM pending nonce and the committed native sequence.
+ * They are one counter, so the larger is the furthest anyone is known to have used it, from either
+ * lane, whichever node lags.
+ */
+async function nextNonce(client: PublicClient, account: RelayerAccount): Promise<bigint> {
+  const [auth, pending] = await Promise.all([accountSequence(account.qor1), pendingNonce(client, account.evm)]);
+  if (auth === undefined) throw new Error(`${account.qor1} does not exist on chain yet: fund it first.`);
+  const evm = BigInt(pending);
+  return evm > auth.sequence ? evm : auth.sequence;
+}
+
+/**
  * The relayer's chain access on the live testnet. The account, with its keys, stays inside this
  * closure: the object returned carries no key, so a handler holding it cannot leak one. Reads use
  * one paused retry; the send uses a client with none, so it fits its 10 s.
@@ -33,18 +45,22 @@ async function waitForQuietNonce(client: PublicClient, account: RelayerAccount, 
 export function liveChain(account: RelayerAccount, reads: PublicClient = evmClient(), sends: PublicClient = evmClient({ retries: 0 })): RelayChain {
   return {
     readWindow: () => readEvmWindow(account.qor1),
-    openWindow: async (request, deadline) => {
+    openWindow: async (request, deadline, beforeBroadcast) => {
       await waitForQuietNonce(reads, account, deadline);
-      return { hash: (await openWindowTx(account, request, WINDOW_OPEN_FEE, deadline)).hash };
+      return { hash: (await openWindowTx(account, request, WINDOW_OPEN_FEE, deadline, beforeBroadcast)).hash };
     },
-    closeWindow: async (deadline) => {
+    closeWindow: async (deadline, beforeBroadcast) => {
       await waitForQuietNonce(reads, account, deadline);
-      return { hash: (await closeWindowTx(account, WINDOW_CLOSE_FEE, deadline)).hash };
+      return { hash: (await closeWindowTx(account, WINDOW_CLOSE_FEE, deadline, beforeBroadcast)).hash };
     },
     call: (req) => ethCall(reads, req),
     estimateGas: (req) => estimateGas(reads, req),
     feeQuote: () => feeQuote(reads),
-    send: (tx, deadline) => sendEvm(sends, account, tx, deadline),
+    send: (tx, deadline, beforeBroadcast) => sendEvm(sends, account, tx, deadline, beforeBroadcast),
+    receipt: (hash, deadline) => receiptFee(reads, hash, deadline),
+    nonce: () => nextNonce(reads, account),
+    txStatus: (kind, hash) => (kind === "evm" ? evmTxStatus(reads, hash) : nativeTxStatus(hash)),
+    registryCodeHash: () => codeKeccak(reads, REGISTRY_ADDRESS),
   };
 }
 

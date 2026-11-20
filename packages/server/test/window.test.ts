@@ -7,10 +7,29 @@ import { evmWindowCost, type EvmWindow } from "@qorechain/evm";
 import { Redis, type Requester } from "@upstash/redis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OutOfTime, startDeadline } from "../src/chain/deadline.ts";
-import type { WindowChain, WindowRequest } from "../src/chain/types.ts";
+import { NotBroadcast } from "../src/chain/evm.ts";
+import { RefusedBeforeInclusion } from "../src/chain/native.ts";
+import type { BeforeBroadcast, WindowChain, WindowRequest } from "../src/chain/types.ts";
 import { DAILY_SPEND_CEILING_UQOR, REGISTRY_ADDRESS, WINDOW_CLOSE_FEE_UQOR, WINDOW_OPEN_FEE_UQOR } from "../src/config.ts";
 import { LOCK_MAX_WAIT_MS, LockBusy, MemoryStore, UpstashStore } from "../src/store.ts";
-import { DailyCeilingReached, RelayerHalted, WindowUnavailable, ensureWindow, haltKey, recordWindowSend, spendKey, spentToday } from "../src/window.ts";
+import {
+  DailyCeilingReached,
+  RelayerHalted,
+  WindowUnavailable,
+  ensureWindow,
+  guardSend,
+  haltKey,
+  ledgerFor,
+  recordWindowSend,
+  releaseSpend,
+  reserveOn,
+  sentThrough,
+  settleSpend,
+  spendKey,
+  spentOn,
+  spentToday,
+} from "../src/window.ts";
+import { retriedWrites } from "./fixtures.ts";
 
 beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -110,19 +129,42 @@ function stubChain(initial: EvmWindow, stored?: (request: WindowRequest) => EvmW
   let current = initial;
   const opens: WindowRequest[] = [];
   let closes = 0;
+  // The account's one counter for EVM nonce and native sequence: every open and close moves it.
+  let nonce = 0n;
+  let signed = 0;
+  // Every open and close lands in a block at once, as txStatus answers for it.
+  const landed = new Set<string>();
+  /** Signs, runs the hook the real chain runs before its broadcast, and refuses to send when it throws. */
+  const sign = async (beforeBroadcast?: BeforeBroadcast): Promise<string> => {
+    const hash = (++signed).toString(16).toUpperCase().padStart(64, "A");
+    try {
+      await beforeBroadcast?.({ kind: "native", nonce, hash });
+    } catch {
+      throw new NotBroadcast("not recorded");
+    }
+    return hash;
+  };
   const chain: WindowChain = {
     readWindow: async () => current,
-    openWindow: async (request) => {
+    openWindow: async (request, _deadline, beforeBroadcast) => {
+      const hash = await sign(beforeBroadcast);
       opens.push(request);
       await new Promise((resolve) => setTimeout(resolve, 20));
+      nonce += 1n;
+      landed.add(hash);
       current = stored?.(request) ?? asOpened(request);
-      return { hash: "AB".repeat(32) };
+      return { hash };
     },
-    closeWindow: async () => {
+    closeWindow: async (_deadline, beforeBroadcast) => {
+      const hash = await sign(beforeBroadcast);
       closes += 1;
+      nonce += 1n;
+      landed.add(hash);
       current = NONE;
-      return { hash: "CD".repeat(32) };
+      return { hash };
     },
+    nonce: async () => nonce,
+    txStatus: async (_kind, hash) => (landed.has(hash) ? "landed" : "unknown"),
   };
   return { chain, opens, closes: () => closes };
 }
@@ -196,6 +238,29 @@ describe("ensureWindow: opening and renewing", () => {
     expect(fits.opens.map((o) => o.maxValue)).toEqual([WORST_TX]);
   });
 
+  it("takes back the open fee when the node refused the open before inclusion, and keeps it when the outcome is unknown", async () => {
+    const { chain } = stubChain(NONE);
+    const refusedChain: WindowChain = {
+      ...chain,
+      openWindow: async () => {
+        throw new RefusedBeforeInclusion(13, "sdk");
+      },
+    };
+    const refused = new MemoryStore();
+    await expect(ensureWindow(deps(refusedChain, refused))).rejects.toEqual(new WindowUnavailable("open_failed"));
+    expect(await spentToday(refused, NOW)).toBe(0n);
+
+    const unknownChain: WindowChain = {
+      ...chain,
+      openWindow: async () => {
+        throw new Error("Transaction AB was not seen on chain in time. Look it up before sending anything again.");
+      },
+    };
+    const unknown = new MemoryStore();
+    await expect(ensureWindow(deps(unknownChain, unknown))).rejects.toEqual(new WindowUnavailable("open_failed"));
+    expect(await spentToday(unknown, NOW)).toBe(WINDOW_OPEN_FEE_UQOR);
+  });
+
   it("does not start a renewal once 20 s of the relay's time have gone", async () => {
     let clock = 0;
     const { chain, opens } = stubChain(NONE);
@@ -238,6 +303,19 @@ describe("ensureWindow: spending by anyone else", () => {
     }
   });
 
+  it("counts a send record written twice by a retried store request once, so it never covers a transaction of someone else's", async () => {
+    const store = new MemoryStore();
+    const swap = store.compareAndSet.bind(store);
+    const add = store.incrWindow.bind(store);
+    store.compareAndSet = async (...args) => (await swap(...args), swap(...args));
+    store.incrWindow = async (...args) => (await add(...args), add(...args));
+    await recordWindowSend(store, 1_000n, WORST_TX);
+    expect(await sentThrough(store, 1_000n)).toEqual({ value: WORST_TX, txs: 1n });
+    const { chain, closes } = stubChain(windowOf({ remainingTxs: 38n, usedTxs: 2n, remainingValue: FULL - 2n * WORST_TX, usedValue: 2n * WORST_TX }));
+    await expect(ensureWindow(deps(chain, store))).rejects.toBeInstanceOf(RelayerHalted);
+    expect(closes()).toBe(1);
+  });
+
   it("on a halted day opens nothing, and still closes a live window it finds", async () => {
     const store = new MemoryStore();
     await store.setIfAbsent(haltKey(NOW), "suspected_key_leak", 172_800);
@@ -247,6 +325,43 @@ describe("ensureWindow: spending by anyone else", () => {
     const live = stubChain(windowOf());
     await expect(ensureWindow(deps(live.chain, store))).rejects.toBeInstanceOf(RelayerHalted);
     expect(live.closes()).toBe(1);
+  });
+});
+
+describe("giving a reservation back", () => {
+  it("gives each reservation back once on every ledger, though the store applied each give-back write twice after a lost reply and two settled at once", async () => {
+    const store = new MemoryStore();
+    const lossy = retriedWrites(store, (_write, key) => key.endsWith(":settled"));
+    const ledgers = [ledgerFor("chair", NOW, OTHER), ledgerFor("chairs", NOW), ledgerFor("total", NOW)];
+    const a = await reserveOn(lossy, ledgers, 30_300n, "rotate");
+    const b = await reserveOn(lossy, ledgers, 30_300n, "rotate");
+    await Promise.all([settleSpend(lossy, a, 10_000n), releaseSpend(lossy, b)]);
+    for (const ledger of ledgers) expect(await spentOn(store, ledger)).toBe(10_000n);
+    // A reservation settled once is not given back again by a later call.
+    await releaseSpend(lossy, a);
+    await settleSpend(lossy, b, 0n);
+    for (const ledger of ledgers) expect(await spentOn(store, ledger)).toBe(10_000n);
+  });
+});
+
+describe("guardSend: the send record", () => {
+  it("gives up the lookup of an earlier send at the same nonce when the relay's time runs out, and so sends nothing", async () => {
+    let clock = 0;
+    const { chain } = stubChain(windowOf());
+    const silent: WindowChain = { ...chain, txStatus: () => new Promise(() => undefined) };
+    const d = { ...deps(silent), deadline: startDeadline(55_000, () => clock) };
+    const first = await guardSend(d, windowOf());
+    await first.beforeBroadcast({ kind: "evm", nonce: first.nonce, hash: `0x${"aa".repeat(32)}` });
+    const second = await guardSend(d, windowOf());
+    clock = 54_950;
+    const outcome = await Promise.race([
+      second.beforeBroadcast({ kind: "evm", nonce: second.nonce, hash: `0x${"bb".repeat(32)}` }).then(
+        () => "recorded",
+        (error: unknown) => error,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve("still waiting"), 2_000)),
+    ]);
+    expect(outcome).toBeInstanceOf(OutOfTime);
   });
 });
 

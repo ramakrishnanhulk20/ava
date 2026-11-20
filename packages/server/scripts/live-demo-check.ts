@@ -10,7 +10,7 @@ import {
   identityFromMnemonic,
   openEpochKey,
   sameAccount,
-  signAction,
+  signChallenge,
   type Identity,
 } from "@ava/core";
 import { buildRegisterPqcKeyMsg, clearPqcStatusCache, fetchPqcStatus, isRegisteredPqcKey, msg, signProofOfPossession, verifyProofOfPossession, withRetry } from "@qorechain/sdk";
@@ -18,12 +18,14 @@ import { bytesToHex, hexToBytes, type Hex } from "viem";
 import { boardRegistryAbi } from "../src/abi/boardRegistry.ts";
 import { VercelBlobBackend } from "../src/blob.ts";
 import { isRelayerMnemonic, publicAddress, relayerFromMnemonic, type RelayerAccount } from "../src/chain/account.ts";
-import { startDeadline } from "../src/chain/deadline.ts";
+import { pause, startDeadline } from "../src/chain/deadline.ts";
 import { codeKeccak, evmClient } from "../src/chain/evm.ts";
 import { assertTestnet, liveChain } from "../src/chain/live.ts";
 import { balanceOf, sendNative } from "../src/chain/native.ts";
 import {
   CHAIN_ID,
+  DEMO_FREE_SEATS,
+  DEMO_GUEST_CAP,
   KEM_REGISTRATION_FEE,
   KEY_REGISTRATION_FEE,
   REGISTRY_ADDRESS,
@@ -33,7 +35,7 @@ import {
   SPONSOR_SEND_FEE_UQOR,
   UQOR_PER_QOR,
 } from "../src/config.ts";
-import { handleDemoChallenge, handleDemoJoin, type DemoContext } from "../src/demo.ts";
+import { freeDemoSeats, handleDemoChallenge, handleDemoJoin, type DemoContext } from "../src/demo.ts";
 import { envelopeUrl, liveDemoChain, provenMldsaKey } from "../src/demoBoard.ts";
 import { loadEnv, type ServerEnv } from "../src/env.ts";
 import { handleSponsor, liveSponsor } from "../src/sponsor.ts";
@@ -47,6 +49,9 @@ const RELAYER_FLOOR_UQOR = 1_000_000n;
 const SPONSOR_FLOOR_UQOR = SPONSOR_AMOUNT_UQOR + SPONSOR_SEND_FEE_UQOR;
 const SEND_BUDGET_MS = 120_000;
 const RECEIPT_WAIT_MS = 90_000;
+/** How long the check waits for a pressure pass it did not start to bring the board back to 34, read every 5 s. */
+const PASS_WAIT_MS = 180_000;
+const PASS_POLL_MS = 5_000;
 
 function formatQor(uqor: bigint): string {
   const fraction = (uqor % UQOR_PER_QOR).toString().padStart(6, "0").replace(/0+$/, "");
@@ -54,7 +59,7 @@ function formatQor(uqor: bigint): string {
 }
 
 function jsonRequest(url: string, body: unknown): Request {
-  return new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  return new Request(url, { method: "POST", headers: { "content-type": "application/json", "x-ava": "1" }, body: JSON.stringify(body) });
 }
 
 async function provenOnRest(account: RelayerAccount): Promise<boolean> {
@@ -74,7 +79,7 @@ async function waitFor(what: string, check: () => Promise<boolean>): Promise<voi
 
 async function publishesOwnKem(identity: Identity): Promise<boolean> {
   try {
-    return Buffer.from(await fetchKemKey(identity.evm)).equals(Buffer.from(identity.seal.mlkemPublicKey));
+    return Buffer.from((await fetchKemKey(identity.evm)).kemPublicKey).equals(Buffer.from(identity.seal.mlkemPublicKey));
   } catch (error) {
     if (error instanceof KemKeyUnavailable && error.reason === "NOT_FOUND") return false;
     throw error;
@@ -108,8 +113,11 @@ async function missingFor(env: ServerEnv | undefined): Promise<string[]> {
  * The demo path a judge takes, end to end on testnet: a fresh guest identity is sponsored through
  * handleSponsor, registers its two keys, asks handleDemoChallenge for a challenge, signs the exact
  * bytes it was given, joins through handleDemoJoin, and once the addMember lands opens the current
- * epoch's envelope with its own keys and decrypts the latest pack. Prints what is missing and sends
- * nothing until the relayer and sponsor are funded and the board is seeded.
+ * epoch's envelope with its own keys and decrypts the latest pack. A join answered board_full runs
+ * one pressure pass (freeDemoSeats) in this process, then asks for a fresh challenge and joins once
+ * more; when that pass answers pass_running, another pass is already at work, so it first waits up
+ * to three minutes for the board to hold 34 members or fewer. Prints what is missing and sends nothing until the relayer and sponsor are funded and the
+ * board is seeded.
  */
 async function main(): Promise<void> {
   if (existsSync(ENV_PATH)) process.loadEnvFile(ENV_PATH);
@@ -167,21 +175,57 @@ async function main(): Promise<void> {
   await waitFor("the guest's keys on chain", async () => provenMldsaKey(await chain.keyStatus(guest.evm)) !== undefined && (await publishesOwnKem(guest)));
   console.log(`balance:  ${formatQor(await balanceOf(guest.qor1))} QOR left after both registrations`);
 
-  const issued = await handleDemoChallenge(jsonRequest("http://internal/api/demo/challenge", { guest: guest.qor1 }), demo());
-  const challenge = (await issued.json()) as { registry: string; boardId: string; botNonce: Hex; expiry: string; message: Hex; error?: string };
-  if (issued.status !== 200) throw new Error(`No challenge: HTTP ${issued.status} ${challenge.error ?? ""}`);
-  const rebuilt = challengeMessage({ registry: challenge.registry, boardId: BigInt(challenge.boardId), guest: guest.evm, botNonce: challenge.botNonce, expiry: BigInt(challenge.expiry) });
-  if (bytesToHex(rebuilt) !== challenge.message.toLowerCase() || !sameAccount(challenge.registry, REGISTRY_ADDRESS) || BigInt(challenge.boardId) !== boardId) {
-    throw new Error("The challenge bytes are not the spec's encoding of the fields it names. Refusing to sign.");
-  }
-  console.log(`challenge: ${hexToBytes(challenge.message).length} bytes for board ${challenge.boardId}, expiry ${challenge.expiry}; rebuilt locally byte for byte`);
-  const signature = bytesToHex(signAction(guest.mldsa.secretKey, hexToBytes(challenge.message)));
+  // A join that is refused uses up its challenge, so each try asks for a fresh one and signs it.
+  const challengeAndJoin = async (): Promise<{ status: number; answer: { txHash?: Hex; error?: string } }> => {
+    const issued = await handleDemoChallenge(jsonRequest("http://internal/api/demo/challenge", { guest: guest.qor1 }), demo());
+    const challenge = (await issued.json()) as { registry: string; boardId: string; botNonce: Hex; expiry: string; message: Hex; error?: string };
+    if (issued.status !== 200) throw new Error(`No challenge: HTTP ${issued.status} ${challenge.error ?? ""}`);
+    const rebuilt = challengeMessage({ registry: challenge.registry, boardId: BigInt(challenge.boardId), guest: guest.evm, botNonce: challenge.botNonce, expiry: BigInt(challenge.expiry) });
+    if (bytesToHex(rebuilt) !== challenge.message.toLowerCase() || !sameAccount(challenge.registry, REGISTRY_ADDRESS) || BigInt(challenge.boardId) !== boardId) {
+      throw new Error("The challenge bytes are not the spec's encoding of the fields it names. Refusing to sign.");
+    }
+    console.log(`challenge: ${hexToBytes(challenge.message).length} bytes for board ${challenge.boardId}, expiry ${challenge.expiry}; rebuilt locally byte for byte`);
+    const latest = await client.getBlock({ blockTag: "latest" });
+    const signed = signChallenge(guest.mldsa.secretKey, {
+      registry: REGISTRY_ADDRESS,
+      boardId,
+      guest: guest.evm,
+      botNonce: challenge.botNonce,
+      expiry: BigInt(challenge.expiry),
+      latestBlockTimestamp: latest.timestamp,
+    });
+    if (bytesToHex(signed.message) !== challenge.message.toLowerCase()) throw new Error("The signed challenge is not the one the bot issued. Stopping.");
+    const signature = bytesToHex(signed.signature);
 
-  const joined = await handleDemoJoin(jsonRequest("http://internal/api/demo/join", { guest: guest.evm, botNonce: challenge.botNonce, expiry: challenge.expiry, signature }), demo());
-  const joinAnswer = (await joined.json()) as { txHash?: Hex; error?: string };
-  console.log(`join:     HTTP ${joined.status} ${JSON.stringify(joinAnswer)}`);
-  if (joined.status !== 202 || joinAnswer.txHash === undefined) throw new Error("The demo bot did not admit the guest. Stopping.");
-  const landed = await chain.receipt(joinAnswer.txHash, RECEIPT_WAIT_MS);
+    const joined = await handleDemoJoin(jsonRequest("http://internal/api/demo/join", { guest: guest.evm, botNonce: challenge.botNonce, expiry: challenge.expiry, signature }), demo());
+    const answer = (await joined.json()) as { txHash?: Hex; error?: string };
+    console.log(`join:     HTTP ${joined.status} ${JSON.stringify(answer)}`);
+    return { status: joined.status, answer };
+  };
+
+  let joined = await challengeAndJoin();
+  if (joined.status === 503 && joined.answer.error === "board_full") {
+    // The app runs this pass in the background once a join has answered. A script has no
+    // background, so it runs one pass here and tries the join once more.
+    const pass = await freeDemoSeats(demo());
+    const removed = pass.removed.map((r) => `${r.member} (${r.reason}, ${r.landed ? "landed" : "receipt not seen"})`).join(", ");
+    console.log(`pressure: removed ${pass.removed.length}${removed === "" ? "" : `: ${removed}`}; stopped: ${pass.stopped.done === "refused" ? `refused ${pass.stopped.reason}` : pass.stopped.done}`);
+    // The join's own background pass is still at work, and only one pass runs at a time.
+    if (pass.stopped.done === "refused" && pass.stopped.reason === "pass_running") {
+      const room = DEMO_GUEST_CAP - DEMO_FREE_SEATS;
+      const until = Date.now() + PASS_WAIT_MS;
+      let members = (await chain.board(boardId)).members.length;
+      while (members > room && Date.now() < until) {
+        await pause(PASS_POLL_MS);
+        members = (await chain.board(boardId)).members.length;
+      }
+      console.log(`pressure: the running pass ${members <= room ? `left ${members} members` : `still leaves ${members} members after ${PASS_WAIT_MS / 60_000} minutes`}; joining once more`);
+    }
+    joined = await challengeAndJoin();
+  }
+  const txHash = joined.answer.txHash;
+  if (joined.status !== 202 || txHash === undefined) throw new Error("The demo bot did not admit the guest. Stopping.");
+  const landed = await chain.receipt(txHash, RECEIPT_WAIT_MS);
   console.log(`receipt:  ${landed ?? "not seen in time"}`);
   if (landed !== "success") throw new Error("The addMember did not land successfully.");
 

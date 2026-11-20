@@ -1,6 +1,6 @@
 import { toQor1 } from "@ava/core";
 import { z } from "zod";
-import { declaredLength, json, pathBelow, readCapped, refuse, TooLarge, type HandlerContext } from "./http.ts";
+import { BodyTimeout, declaredLength, json, pathBelow, readBody, readCapped, refuse, refuseCrossSite, TooLarge, type HandlerContext } from "./http.ts";
 import { logEvent } from "./log.ts";
 import { limit } from "./ratelimit.ts";
 import { accountBytesStrict } from "./requestAddress.ts";
@@ -210,6 +210,8 @@ async function forward(url: URL, method: "GET" | "POST", body: string | undefine
 }
 
 async function admit(request: Request, ctx: ProxyContext, method: "GET" | "POST"): Promise<Response | string> {
+  const crossSite = refuseCrossSite(request);
+  if (crossSite !== undefined) return crossSite;
   if (request.method !== method) return refuse(405, "method_not_allowed", { allow: method });
   const rule = ctx.limits ?? PROXY_LIMITS;
   const verdict = await limit(ctx.store, { scope: "proxy", clientIp: ctx.clientIp, ...rule });
@@ -225,7 +227,9 @@ async function admit(request: Request, ctx: ProxyContext, method: "GET" | "POST"
  * GET proxy to the chain's public REST, for the reads browsers cannot make directly because the
  * REST sends no CORS headers (threat model C22, C23).
  *
- * Answers 405 for another method, 429 over the rate limit or when the limit cannot be checked, 400
+ * First of all, a request another site's page could have sent is refused with 403 `cross_site`
+ * (refuseCrossSite), before it is counted or sent upstream. Then answers 405 for another method,
+ * 429 over the rate limit or when the limit cannot be checked, 400
  * for a query string or a parameter its codec refuses, 404 for any other path, 502 for an upstream
  * redirect, fault, oversized or non-JSON body, and 504 on timeout. The upstream is never called for
  * a refused request. No request header is forwarded.
@@ -250,7 +254,8 @@ export async function handleChainGet(request: Request, ctx: ProxyContext): Promi
  * BROADCAST_MODE_SYNC and nothing else. What goes upstream is the validated object re-serialised,
  * never the raw body.
  *
- * Answers as handleChainGet, plus 415 for another content type and 413 over the cap.
+ * Answers as handleChainGet, plus 415 for another content type, 413 over the cap and 408 for a body
+ * that has not ended after 20 seconds.
  */
 export async function handleChainPost(request: Request, ctx: ProxyContext): Promise<Response> {
   const admitted = await admit(request, ctx, "POST");
@@ -264,11 +269,11 @@ export async function handleChainPost(request: Request, ctx: ProxyContext): Prom
   if (request.body === null) return refuse(400, "bad_body");
   let parsed: unknown;
   try {
-    const bytes = await readCapped(request.body, PROXY_BODY_CAP);
+    const bytes = await readBody(request.body, PROXY_BODY_CAP);
     parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch (error) {
     if (error instanceof TooLarge) return refuse(413, "body_too_large");
-    return refuse(400, "bad_body");
+    return error instanceof BodyTimeout ? refuse(408, "body_timeout") : refuse(400, "bad_body");
   }
   const checked = schema.safeParse(parsed);
   if (!checked.success) {

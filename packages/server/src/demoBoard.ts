@@ -3,27 +3,25 @@ import {
   HashMismatch,
   ML_DSA_87_PUBKEY,
   Mode,
-  actionMessage,
   assertHash,
   deadlineFrom,
   fetchKemKey,
   openEpochKey,
-  paramsAdd,
-  paramsCreate,
-  paramsPost,
-  paramsRemove,
   sameAccount,
   sameHash,
   sha256,
-  signAction,
+  signBoardAction,
+  type BoardActionInput,
   type Identity,
+  type KemRecipient,
+  type OpenedEpochKey,
 } from "@ava/core";
 import { parseEnvelope, recipientHint } from "@qorechain/qoreseal";
-import { bytesToHex, decodeAbiParameters, encodeFunctionData, hexToBytes, type Hex, type PublicClient } from "viem";
+import { bytesToHex, decodeAbiParameters, encodeFunctionData, getAbiItem, hexToBytes, type Hex, type PublicClient } from "viem";
 import { boardRegistryAbi } from "./abi/boardRegistry.ts";
 import { handleUpload, sameUrl, type BlobBackend, type UploadContext } from "./blob.ts";
 import { evmClient } from "./chain/evm.ts";
-import { DEMO_ACTION_SECONDS, DEMO_GUEST_CAP, REGISTRY_ADDRESS } from "./config.ts";
+import { DEMO_ACTION_SECONDS, DEMO_GUEST_CAP, REGISTRY_ADDRESS, REGISTRY_DEPLOY_BLOCK } from "./config.ts";
 import { isHttpsOrigin } from "./env.ts";
 import { handleRelay, type RelayContext } from "./relay.ts";
 
@@ -58,6 +56,15 @@ const MAX_ENVELOPES_TRIED = 4;
  */
 const MAX_GRANTS_READ = 2 * DEMO_GUEST_CAP;
 const ENVELOPES_PARALLEL = 4;
+const ENVELOPE_GRANTED = getAbiItem({ abi: boardRegistryAbi, name: "EnvelopeGranted" });
+/** The most blocks one eth_getLogs read covers on the testnet RPC, as in envelopeSweep.ts. */
+const GRANT_LOG_PAGE_BLOCKS = 10_000n;
+/**
+ * A grant search reads at most 50 pages back, about eight days at 1.4 s a block. A member no page
+ * names was granted before the oldest block read, which is long past a guest's six hours.
+ */
+const MAX_GRANT_LOG_PAGES = 50;
+const BLOCKS_PARALLEL = 4;
 
 /** A step of a demo board action that cannot go on. `reason` is a short code this package chose. */
 export class DemoStop extends Error {
@@ -107,10 +114,55 @@ export interface DemoChain {
   board(boardId: bigint): Promise<BoardSnapshot>;
   /** The account's pqcKeyStatus, all four values. */
   keyStatus(account: Hex): Promise<KeyStatus>;
-  /** The account's ML-KEM-1024 key from qor_getKEMKey, through @ava/core's fetchKemKey (threat model C15). */
-  kemKey(account: Hex): Promise<Uint8Array>;
+  /** The account and its ML-KEM-1024 key from qor_getKEMKey, as the pair @ava/core's fetchKemKey builds (threat model C15). */
+  kemKey(account: Hex): Promise<KemRecipient>;
   /** The receipt's status, or undefined when the transaction has not landed within `timeoutMs`. */
   receipt(hash: Hex, timeoutMs: number): Promise<"success" | "reverted" | undefined>;
+  /**
+   * For each of `members`, in order, the block timestamp in Unix seconds of the latest EnvelopeGranted
+   * on this board naming it (threat model C34). A member named by none of the logs read gets the
+   * timestamp of the oldest block read: it has been a member at least since then.
+   */
+  grantTimes(boardId: bigint, members: readonly Hex[]): Promise<bigint[]>;
+}
+
+/**
+ * The latest EnvelopeGranted block naming each member, read backwards from the latest block a page
+ * at a time until every member is found, the deploy block is reached, or MAX_GRANT_LOG_PAGES are
+ * read. Each log is checked like an input: emitted by the registry, not removed, for this board.
+ */
+async function readGrantTimes(client: PublicClient, boardId: bigint, members: readonly Hex[]): Promise<bigint[]> {
+  const found: (bigint | undefined)[] = members.map(() => undefined);
+  let to = await client.getBlockNumber();
+  let oldest = to;
+  for (let page = 0; page < MAX_GRANT_LOG_PAGES && to >= REGISTRY_DEPLOY_BLOCK && found.includes(undefined); page++) {
+    const from = to - GRANT_LOG_PAGE_BLOCKS + 1n > REGISTRY_DEPLOY_BLOCK ? to - GRANT_LOG_PAGE_BLOCKS + 1n : REGISTRY_DEPLOY_BLOCK;
+    const logs = await client.getLogs({ address: REGISTRY_ADDRESS, event: ENVELOPE_GRANTED, args: { boardId }, fromBlock: from, toBlock: to, strict: false });
+    for (const log of logs) {
+      const { member } = log.args;
+      if (log.removed || !sameAccount(log.address, REGISTRY_ADDRESS) || log.args.boardId !== boardId || typeof member !== "string" || typeof log.blockNumber !== "bigint") {
+        throw new Error("A log is not an EnvelopeGranted event of the registry for this board.");
+      }
+      members.forEach((m, i) => {
+        const seen = found[i];
+        if (sameAccount(m, member) && (seen === undefined || log.blockNumber > seen)) found[i] = log.blockNumber;
+      });
+    }
+    oldest = from;
+    to = from - 1n;
+  }
+  const blocks = [...new Set(found.map((b) => b ?? oldest))];
+  const times = new Map<bigint, bigint>();
+  for (let start = 0; start < blocks.length; start += BLOCKS_PARALLEL) {
+    await Promise.all(
+      blocks.slice(start, start + BLOCKS_PARALLEL).map(async (number) => {
+        const block = await client.getBlock({ blockNumber: number });
+        if (block.number !== number) throw new Error("The node answered with another block.");
+        times.set(number, block.timestamp);
+      }),
+    );
+  }
+  return found.map((b) => times.get(b ?? oldest) as bigint);
 }
 
 /** pqcKeyStatus read straight from the precompile with the four-value layout. Throws on empty or short data. */
@@ -155,6 +207,7 @@ export function liveDemoChain(client: PublicClient = evmClient()): DemoChain {
     },
     keyStatus: (account) => readKeyStatus(client, account),
     kemKey: (account) => fetchKemKey(account),
+    grantTimes: (boardId, members) => readGrantTimes(client, boardId, members),
     receipt: async (hash, timeoutMs) => {
       if (timeoutMs <= 0) return undefined;
       try {
@@ -184,11 +237,12 @@ function isNotRecipient(error: unknown): boolean {
  * stopping at its on-chain size, and openEpochKey refuses it unless its size and SHA-256 equal the
  * registry's record and its payload names this epoch, before any key is used.
  *
+ * @returns An OpenedEpochKey: the one key type a document may be encrypted under (C12).
  * @throws DemoStop: envelope_unavailable when an envelope is missing or cannot be read,
  *   envelope_mismatch on any size, hash or payload failure (the join stops there), and
  *   chair_not_recipient when no grant opens.
  */
-export async function openCurrentEpochKey(p: { snapshot: BoardSnapshot; sealKeys: Identity["seal"]; blobs: BlobBackend; blobOrigin: string; signal?: AbortSignal }): Promise<Uint8Array> {
+export async function openCurrentEpochKey(p: { snapshot: BoardSnapshot; sealKeys: Identity["seal"]; blobs: BlobBackend; blobOrigin: string; signal?: AbortSignal }): Promise<OpenedEpochKey> {
   const { snapshot } = p;
   const candidates = snapshot.grants.filter((g) => g.mode === Mode.ROTATE || sameAccount(g.member, snapshot.chair)).slice(0, MAX_ENVELOPES_TRIED);
   for (const grant of candidates) {
@@ -301,9 +355,13 @@ export interface RelayOutcome {
   error?: string;
 }
 
-/** Submits one signed action through the one relay pipeline (handleRelay); there is no second sender. */
+/**
+ * Submits one signed action through the one relay pipeline (handleRelay); there is no second sender.
+ * The request carries x-ava as our app does, so a script's public relay passes the cross-site check;
+ * the bot's own relays, scoped "demo", skip it.
+ */
 export async function relayAction(body: RelayBody, ctx: RelayContext): Promise<RelayOutcome> {
-  const request = new Request("http://internal/api/relay", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const request = new Request("http://internal/api/relay", { method: "POST", headers: { "content-type": "application/json", "x-ava": "1" }, body: JSON.stringify(body) });
   const response = await handleRelay(request, ctx);
   const answer = (await response.json().catch(() => ({}))) as { txHash?: unknown; error?: unknown };
   if (response.status === 202 && typeof answer.txHash === "string" && /^0x[0-9a-f]{64}$/.test(answer.txHash)) return { status: 202, txHash: answer.txHash as Hex };
@@ -328,43 +386,47 @@ export interface RelayBody {
 }
 
 /**
- * Builds the exact message for one action from values the signer read itself (threat model C2, C4,
- * C33), signs it with the chair's ML-DSA-87 key and returns the relay body. The nonce is the
- * board's (or, for create, the chair's creation nonce), and the deadline is DEMO_ACTION_SECONDS
- * after the latest block's timestamp, never the device clock.
+ * Builds one action from values the signer read itself (threat model C2, C4, C33), signs it with
+ * the chair's ML-DSA-87 key through signBoardAction, which rebuilds the exact message from these
+ * typed fields, and returns the relay body. The nonce is the board's (or, for create, the chair's
+ * creation nonce), and the deadline is DEMO_ACTION_SECONDS after the latest block's timestamp,
+ * never the device clock.
  *
- * @param at For create: boardId 0n and the creation nonce. Otherwise the snapshot the action was built from.
+ * @param at For create: boardId 0n and the creation nonce. Otherwise the snapshot the action was
+ *   built from. `blockTimestamp` is the latest block's, from the same chain read.
+ * @throws ActionError or AddressError from signBoardAction for a field outside its type.
  */
 export function signedAction(chair: Identity, at: { boardId: bigint; nonce: bigint; blockTimestamp: bigint }, spec: ActionSpec): RelayBody {
   const deadline = deadlineFrom(at.blockTimestamp, DEMO_ACTION_SECONDS);
-  let action: Action;
-  let paramsHash: Hex;
+  let input: BoardActionInput;
   let params: Record<string, string>;
   switch (spec.kind) {
     case "create":
-      action = Action.CREATE;
-      paramsHash = paramsCreate({ chair: chair.evm, boardRef: spec.boardRef, envelopeHash: spec.envelopeHash, envelopeSize: spec.envelopeSize });
+      input = { action: Action.CREATE, chair: chair.evm, boardRef: spec.boardRef, envelopeHash: spec.envelopeHash, envelopeSize: spec.envelopeSize };
       params = { chair: chair.evm, boardRef: spec.boardRef, envelopeHash: spec.envelopeHash, envelopeSize: String(spec.envelopeSize) };
       break;
     case "add":
-      action = Action.ADD;
-      paramsHash = paramsAdd(spec);
+      input = { action: Action.ADD, member: spec.member, mode: spec.mode, envelopeHash: spec.envelopeHash, envelopeSize: spec.envelopeSize, epochAfter: spec.epochAfter };
       params = { member: spec.member, mode: String(spec.mode), envelopeHash: spec.envelopeHash, envelopeSize: String(spec.envelopeSize), epochAfter: spec.epochAfter.toString() };
       break;
     case "remove":
-      action = Action.REMOVE;
-      paramsHash = paramsRemove(spec);
+      input = { action: Action.REMOVE, member: spec.member, envelopeHash: spec.envelopeHash, envelopeSize: spec.envelopeSize, epochAfter: spec.epochAfter };
       params = { member: spec.member, envelopeHash: spec.envelopeHash, envelopeSize: String(spec.envelopeSize), epochAfter: spec.epochAfter.toString() };
       break;
     case "post":
-      action = Action.POST;
-      paramsHash = paramsPost(spec);
+      input = { action: Action.POST, docRef: spec.docRef, cipherHash: spec.cipherHash, cipherSize: spec.cipherSize, epoch: spec.epoch };
       params = { docRef: spec.docRef, cipherHash: spec.cipherHash, cipherSize: spec.cipherSize.toString(), epoch: spec.epoch.toString() };
       break;
   }
-  const message = actionMessage({ registry: REGISTRY_ADDRESS, action, boardId: at.boardId, paramsHash, nonce: at.nonce, deadline });
-  const signature = bytesToHex(signAction(chair.mldsa.secretKey, message));
-  const body: RelayBody = { action: spec.kind, params, deadline: deadline.toString(), signature };
+  const { signature } = signBoardAction(chair.mldsa.secretKey, {
+    ...input,
+    registry: REGISTRY_ADDRESS,
+    boardId: at.boardId,
+    nonce: at.nonce,
+    deadline,
+    latestBlockTimestamp: at.blockTimestamp,
+  });
+  const body: RelayBody = { action: spec.kind, params, deadline: deadline.toString(), signature: bytesToHex(signature) };
   if (spec.kind !== "create") body.boardId = at.boardId.toString();
   return body;
 }

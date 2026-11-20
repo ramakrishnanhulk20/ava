@@ -6,6 +6,7 @@ import { CHAIN_ID, DENOM, HTTP, MAX_NATIVE_FEE_UQOR, MIN_GAS_PRICE_MILLI_UQOR, R
 import { logEvent } from "../log.ts";
 import type { RelayerAccount } from "./account.ts";
 import { OutOfTime, leftMs, pause, within, type Deadline } from "./deadline.ts";
+import { NotBroadcast, type BeforeBroadcast, type TxStatus } from "./evm.ts";
 
 export type Messages = EthTxParams["messages"];
 export type Fee = EthTxParams["fee"];
@@ -19,6 +20,19 @@ export interface CommittedTx {
 }
 
 type Json = Record<string, unknown>;
+
+/** The node refused the transaction before any block included it: no fee was charged and no sequence used. */
+export class RefusedBeforeInclusion extends Error {
+  readonly code: number;
+  readonly codespace: string;
+
+  constructor(code: number, codespace: string) {
+    super(`Refused before inclusion (no fee charged): code ${code} ${codespace}`);
+    this.name = "RefusedBeforeInclusion";
+    this.code = code;
+    this.codespace = codespace;
+  }
+}
 
 /** How often a broadcast transaction is looked up while waiting for its block (blocks are about 1.4 s). */
 const COMMIT_POLL_MS = 1_500;
@@ -125,11 +139,22 @@ function requireHybridVerified(hash: string, body: Json): void {
  * is computed before sending and looked up on chain. Every wait ends by `deadline`.
  *
  * @param mode "classical" only for MsgRegisterPQCKeyV2; everything else is "hybrid".
- * @throws OutOfTime before the broadcast (nothing was sent). An Error when the account does not
- *   exist, the fee is outside its bounds, the chain refuses the transaction, it is not seen in time,
- *   or a hybrid transaction lacks the chain's verified verdict.
+ * @param beforeBroadcast Given the sequence and hash once signed, before the broadcast (threat model
+ *   C24). If it throws, nothing is sent.
+ * @throws OutOfTime before the broadcast (nothing was sent). NotBroadcast when beforeBroadcast threw
+ *   (nothing was sent). RefusedBeforeInclusion when the node refused it at broadcast (no fee
+ *   charged). An Error when the account does not exist, the fee is outside its bounds, the chain
+ *   refuses the transaction in a block, it is not seen in time, or a hybrid transaction lacks the
+ *   chain's verified verdict.
  */
-export async function sendNative(account: RelayerAccount, mode: "classical" | "hybrid", messages: Messages, fee: Fee, deadline: Deadline): Promise<CommittedTx> {
+export async function sendNative(
+  account: RelayerAccount,
+  mode: "classical" | "hybrid",
+  messages: Messages,
+  fee: Fee,
+  deadline: Deadline,
+  beforeBroadcast?: BeforeBroadcast,
+): Promise<CommittedTx> {
   assertFeeBounds(fee);
   const auth = await within(deadline, accountSequence(account.qor1), "reading the sequence");
   if (auth === undefined) throw new Error(`${account.qor1} does not exist on chain yet: fund it first.`);
@@ -138,6 +163,11 @@ export async function sendNative(account: RelayerAccount, mode: "classical" | "h
   const signBytesVersion = mode === "hybrid" ? await within(deadline, signer.resolveSignBytesVersion(CHAIN_ID), "resolving the sign bytes") : undefined;
   const { txRawBytes } = signer.sign({ chainId: CHAIN_ID, accountNumber: auth.accountNumber, sequence: auth.sequence, messages, memo: "", fee, signBytesVersion });
   const hash = sha256Hex(txRawBytes).replace(/^0x/, "").toUpperCase();
+  try {
+    await beforeBroadcast?.({ kind: "native", nonce: auth.sequence, hash });
+  } catch {
+    throw new NotBroadcast("The native transaction could not be recorded before its broadcast: nothing was sent.");
+  }
 
   const transport = await within(deadline, StargateClient.connect(RPC), "connecting to the RPC");
   const waitMs = leftMs(deadline);
@@ -148,7 +178,7 @@ export async function sendNative(account: RelayerAccount, mode: "classical" | "h
   try {
     await transport.broadcastTx(txRawBytes, waitMs, COMMIT_POLL_MS);
   } catch (err) {
-    if (err instanceof BroadcastTxError) throw new Error(`Refused before inclusion (no fee charged): code ${err.code} ${err.codespace}`);
+    if (err instanceof BroadcastTxError) throw new RefusedBeforeInclusion(err.code, err.codespace);
     logEvent("native_broadcast_unconfirmed", { hash });
   } finally {
     transport.disconnect();
@@ -158,6 +188,29 @@ export async function sendNative(account: RelayerAccount, mode: "classical" | "h
   if (mode === "hybrid") requireHybridVerified(hash, committed);
   const response = committed.tx_response as Json;
   return { hash, height: String(response.height ?? ""), gasUsed: String(response.gas_used ?? ""), gasWanted: String(response.gas_wanted ?? ""), fee };
+}
+
+/**
+ * Where the relayer's native transaction `hash` (64 hex digits) stands: "landed" when the chain's
+ * REST holds it at a block height, whatever its result code, because a failed transaction still
+ * used its sequence; "unknown" on a 404. The REST shows no pool, so this never answers "pending".
+ * Any other answer, or one naming another transaction, is thrown.
+ */
+export async function nativeTxStatus(hash: string): Promise<TxStatus> {
+  if (!/^[0-9A-F]{64}$/.test(hash)) throw new Error("A native transaction hash is 64 uppercase hex digits.");
+  let body: Json;
+  try {
+    body = await getJson<Json>(`${REST}/cosmos/tx/v1beta1/txs/${hash}`, HTTP);
+  } catch (err) {
+    if (err instanceof QoreHttpError && err.status === 404) return "unknown";
+    throw err;
+  }
+  const response = body.tx_response as Json | undefined;
+  const named = typeof response?.txhash === "string" ? response.txhash.toUpperCase() : undefined;
+  if (named !== hash || typeof response?.height !== "string" || !/^[1-9]\d{0,19}$/.test(response.height)) {
+    throw new Error(`Transaction ${hash}: the lookup answered with something else.`);
+  }
+  return "landed";
 }
 
 export interface WindowRequest {
@@ -170,9 +223,10 @@ export interface WindowRequest {
 /**
  * Opens (and so replaces) the relayer's EVM window with exactly these bounds, by a hybrid-signed
  * MsgOpenEVMWindow at the given explicit fee. A window with no targets would be unscoped, so an
- * empty list is refused here and never reaches the chain; nativeOnly is never set.
+ * empty list is refused here and never reaches the chain; nativeOnly is never set. `beforeBroadcast`
+ * is sendNative's.
  */
-export async function openWindowTx(account: RelayerAccount, request: WindowRequest, fee: Fee, deadline: Deadline): Promise<CommittedTx> {
+export async function openWindowTx(account: RelayerAccount, request: WindowRequest, fee: Fee, deadline: Deadline, beforeBroadcast?: BeforeBroadcast): Promise<CommittedTx> {
   if (request.allowedTargets.length === 0) throw new Error("Refusing to open an unscoped window.");
   const message = openEvmWindowMsg({
     sender: account.qor1,
@@ -181,10 +235,13 @@ export async function openWindowTx(account: RelayerAccount, request: WindowReque
     maxValue: request.maxValue,
     allowedTargets: [...request.allowedTargets],
   });
-  return sendNative(account, "hybrid", [message], fee, deadline);
+  return sendNative(account, "hybrid", [message], fee, deadline, beforeBroadcast);
 }
 
-/** Closes the relayer's window at once by a hybrid-signed MsgCloseEVMWindow; the chain refuses what it admitted from the next block. */
-export async function closeWindowTx(account: RelayerAccount, fee: Fee, deadline: Deadline): Promise<CommittedTx> {
-  return sendNative(account, "hybrid", [closeEvmWindowMsg(account.qor1)], fee, deadline);
+/**
+ * Closes the relayer's window at once by a hybrid-signed MsgCloseEVMWindow; the chain refuses what it
+ * admitted from the next block. `beforeBroadcast` is sendNative's.
+ */
+export async function closeWindowTx(account: RelayerAccount, fee: Fee, deadline: Deadline, beforeBroadcast?: BeforeBroadcast): Promise<CommittedTx> {
+  return sendNative(account, "hybrid", [closeEvmWindowMsg(account.qor1)], fee, deadline, beforeBroadcast);
 }

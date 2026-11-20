@@ -2,9 +2,10 @@ import { MAX_ENVELOPE_SIZE, sha256 } from "@ava/core";
 import { parseEnvelope } from "@qorechain/qoreseal";
 import { BlobNotFoundError, del, head, list, put } from "@vercel/blob";
 import { isHttpsOrigin } from "./env.ts";
-import { declaredLength, json, readCapped, refuse, TooLarge, type HandlerContext } from "./http.ts";
+import { BodyTimeout, declaredLength, json, readBody, readCapped, refuse, refuseCrossSite, TooLarge, type HandlerContext } from "./http.ts";
 import { logEvent } from "./log.ts";
 import { hasBudget, limit, spendBudget } from "./ratelimit.ts";
+import type { SharedStore } from "./store.ts";
 
 /** What the store reports about one blob. `uploadedAt` is in milliseconds since the epoch. */
 export interface BlobInfo {
@@ -228,6 +229,12 @@ export interface UploadContext extends HandlerContext {
   blobOrigin: string;
   /** Overrides UPLOAD_LIMITS. */
   limits?: { perIp: number; total: number; windowSeconds: number; bytesPerIp: number };
+  /**
+   * Set only by server code for an upload it makes itself (the demo bot's joins, its scheduled guest
+   * removals), never from anything in a request. The upload then skips the cross-site check and
+   * every per-IP and anonymous limit, and counts against INTERNAL_UPLOAD_LIMITS for its own scope.
+   */
+  internal?: "demo-bot" | "sweep";
 }
 
 /**
@@ -242,6 +249,37 @@ export const UPLOAD_CAPS = { envelope: MAX_ENVELOPE_SIZE } as const;
  * everyone's uploads (docs/security/runbook.md, Known limits).
  */
 export const UPLOAD_LIMITS = { perIp: 20, total: 1_000, windowSeconds: 3600, bytesPerIp: 20 * MAX_ENVELOPE_SIZE } as const;
+
+/**
+ * Per UTC day, for each internal scope on its own: the server's own uploads. A demo join or a guest
+ * removal uploads one envelope, and the demo admits at most 120 guests a day (DEMO_JOIN_LIMITS.perDay
+ * in config.ts), so 600 is five times what a full day needs. Anonymous traffic can never spend it.
+ */
+export const INTERNAL_UPLOAD_LIMITS = { perDay: 600 } as const;
+
+const INTERNAL_SCOPES: ReadonlySet<string> = new Set(["demo-bot", "sweep"]);
+// The key is named for its UTC day, so it lives two days and a new day always starts a new count.
+const INTERNAL_DAY_KEY_SECONDS = 2 * 86_400;
+
+/** Counts one server-side upload against its scope's budget for the UTC day. False, never a throw, on a store error. */
+async function countInternal(store: SharedStore, scope: string, now: number): Promise<boolean> {
+  try {
+    const day = new Date(now).toISOString().slice(0, 10);
+    if ((await store.incrWindow(`rate:upload:internal:${scope}:${day}`, INTERNAL_DAY_KEY_SECONDS)) <= INTERNAL_UPLOAD_LIMITS.perDay) return true;
+    logEvent("rate_limited", { scope: "upload", internal: scope, reason: "per_day" });
+  } catch {
+    logEvent("rate_refused", { scope: "upload", internal: scope, reason: "store_error" });
+  }
+  return false;
+}
+
+/** Seconds from `now` (milliseconds since the epoch) to the next UTC midnight, for a retry-after; 60 for a clock that gives no sane answer. */
+export function secondsToUtcMidnight(now: number): number {
+  const next = new Date(now);
+  next.setUTCHours(24, 0, 0, 0);
+  const seconds = Math.ceil((next.getTime() - now) / 1000);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 60;
+}
 
 type Kind = keyof typeof UPLOAD_CAPS;
 
@@ -263,29 +301,49 @@ export function sameUrl(given: string, expected: string): boolean {
 
 /**
  * Stores an encrypted epoch-key envelope under the SHA-256 of the bytes the server received
- * (threat model C28, C29, C30). Documents are not taken here: they go through docupload.ts.
+ * (threat model C23, C28, C29, C30). Documents are not taken here: they go through docupload.ts.
  *
- * The query is exactly `kind=envelope`; `kind=document` and anything else is refused with 400. Any
- * name, path or content type the client sends is ignored. The body is read as a stream and refused
- * with 413 the moment it passes the 110,000-byte cap, before more is buffered. Bytes that QoreSeal's
- * parseEnvelope does not accept as an envelope are refused with 400 `not_an_envelope` and never
- * stored, after they are counted against the IP's byte budget. An
+ * First of all, a request another site's page could have sent is refused with 403 `cross_site`
+ * (refuseCrossSite), and a content type other than exactly `application/octet-stream` with 415
+ * `content_type`; neither is counted, read or stored. The query is exactly `kind=envelope`;
+ * `kind=document` and anything else is refused with 400. Any name or path the client sends is
+ * ignored. The body is read as a stream, refused with 413 the moment it passes the 110,000-byte
+ * cap, before more is buffered, and with 408 `body_timeout` when it has not ended after 20 seconds.
+ * Bytes that QoreSeal's parseEnvelope does not accept as an envelope are refused with 400
+ * `not_an_envelope` and never stored, after they are counted against the IP's byte budget. An
  * existing blob is never written again: the answer is 200 with its URL. A new one is 201. Either
  * way the body is `{ sha256, size, url }`, with `sha256` as 64 lowercase hex characters and `url`
  * checked to equal `${blobOrigin}/${kind}/${sha256}` before it is returned, because the chair will
  * sign it and a signed URL stays on chain.
  *
- * Refuses with 405 for another method, 400 for a bad query, an empty body or bytes that are not an
- * envelope, 413 over the cap, 429
- * over the request limits or the hourly per-IP byte budget (or when they cannot be checked), and 502
- * when the store fails or answers with any other URL.
+ * With `ctx.internal` set by server code, the cross-site check and every per-IP and anonymous
+ * limit are skipped, and the upload counts against INTERNAL_UPLOAD_LIMITS for that scope instead.
+ *
+ * Refuses with 403 cross-site, 405 for another method, 415 for another content type, 400 for a bad
+ * query, an empty body or bytes that are not an envelope, 408 for a body that does not end, 413
+ * over the cap, 429 over the request limits, the hourly per-IP byte budget or an internal scope's
+ * day (or when they cannot be checked), 500 for an unknown internal scope or a malformed
+ * BLOB_ORIGIN, and 502 when the store fails or answers with any other URL.
  */
 export async function handleUpload(request: Request, ctx: UploadContext): Promise<Response> {
+  // Server code builds its own request when it sets `internal`, so there is no browser to check.
+  const crossSite = ctx.internal === undefined ? refuseCrossSite(request) : undefined;
+  if (crossSite !== undefined) return crossSite;
   if (request.method !== "POST") return refuse(405, "method_not_allowed", { allow: "POST" });
+  // A form or a beacon can only send a few simple types, so requiring this one shuts both out.
+  if (request.headers.get("content-type") !== "application/octet-stream") return refuse(415, "content_type");
+  if (ctx.internal !== undefined && !INTERNAL_SCOPES.has(ctx.internal)) {
+    logEvent("upload_refused", { reason: "bad_internal_scope" });
+    return refuse(500, "server_misconfigured");
+  }
   const rules = ctx.limits ?? UPLOAD_LIMITS;
   const retry = (seconds: number) => ({ "retry-after": String(seconds) });
-  const verdict = await limit(ctx.store, { scope: "upload", clientIp: ctx.clientIp, ...rules });
-  if (!verdict.ok) return refuse(429, "rate_limited", retry(verdict.retryAfter));
+  if (ctx.internal === undefined) {
+    const verdict = await limit(ctx.store, { scope: "upload", clientIp: ctx.clientIp, ...rules });
+    if (!verdict.ok) return refuse(429, "rate_limited", retry(verdict.retryAfter));
+  } else if (!(await countInternal(ctx.store, ctx.internal, ctx.now))) {
+    return refuse(429, "rate_limited", retry(secondsToUtcMidnight(ctx.now)));
+  }
   const kind = kindOf(request);
   if (kind === undefined) return refuse(400, "bad_kind");
   if (!isHttpsOrigin(ctx.blobOrigin)) {
@@ -295,21 +353,27 @@ export async function handleUpload(request: Request, ctx: UploadContext): Promis
   const cap = UPLOAD_CAPS[kind];
   const stated = declaredLength(request);
   if (stated !== undefined && stated > cap) return refuse(413, "body_too_large");
-  const budget = { scope: "upload", clientIp: ctx.clientIp, max: rules.bytesPerIp, windowSeconds: rules.windowSeconds };
-  const left = await hasBudget(ctx.store, budget);
-  if (!left.ok) return refuse(429, "byte_budget_spent", retry(left.retryAfter));
+  const budget = ctx.internal === undefined ? { scope: "upload", clientIp: ctx.clientIp, max: rules.bytesPerIp, windowSeconds: rules.windowSeconds } : undefined;
+  if (budget !== undefined) {
+    const left = await hasBudget(ctx.store, budget);
+    if (!left.ok) return refuse(429, "byte_budget_spent", retry(left.retryAfter));
+  }
   if (request.body === null) return refuse(400, "empty_body");
 
   let bytes: Uint8Array;
   try {
-    bytes = await readCapped(request.body, cap);
+    bytes = await readBody(request.body, cap);
   } catch (error) {
-    logEvent("upload_refused", { kind, reason: error instanceof TooLarge ? "too_large" : "unreadable" });
-    return error instanceof TooLarge ? refuse(413, "body_too_large") : refuse(400, "bad_body");
+    const reason = error instanceof TooLarge ? "too_large" : error instanceof BodyTimeout ? "body_timeout" : "unreadable";
+    logEvent("upload_refused", { kind, reason });
+    if (error instanceof TooLarge) return refuse(413, "body_too_large");
+    return error instanceof BodyTimeout ? refuse(408, "body_timeout") : refuse(400, "bad_body");
   }
   if (bytes.byteLength === 0) return refuse(400, "empty_body");
-  const spent = await spendBudget(ctx.store, budget, bytes.byteLength);
-  if (!spent.ok) return refuse(429, "byte_budget_spent", retry(spent.retryAfter));
+  if (budget !== undefined) {
+    const spent = await spendBudget(ctx.store, budget, bytes.byteLength);
+    if (!spent.ok) return refuse(429, "byte_budget_spent", retry(spent.retryAfter));
+  }
   // QoreSeal's own parser decides what an envelope is, so the store holds nothing else. It reads
   // the header and the recipient entries; it cannot tell whether the payload will decrypt.
   try {

@@ -91,7 +91,7 @@ function keepPhrase(phrase: string, chair: RelayerAccount, next: PqcKeypair): vo
   const lead = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
   appendFileSync(ENV_PATH, `${lead}${NEXT_NAME}="${phrase}"\n`, { encoding: "utf8", mode: 0o600 });
   const stored = parseEnv(readFileSync(ENV_PATH, "utf8"))[NEXT_NAME];
-  if (stored === undefined || !sameBytes(derivePqcCanonical(chair.qor1, normalizeMnemonic(stored)).publicKey, next.publicKey)) {
+  if (stored === undefined || !isRelayerMnemonic(stored) || !sameBytes(derivePqcCanonical(chair.qor1, normalizeMnemonic(stored)).publicKey, next.publicKey)) {
     throw new Error(`Read-back of ${NEXT_NAME} in ${ENV_PATH} does not give the new key. Nothing was sent; delete that line and rerun.`);
   }
 }

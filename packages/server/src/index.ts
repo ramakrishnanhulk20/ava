@@ -20,11 +20,11 @@ export {
   type BlobBackend,
   type UploadContext,
 } from "./blob.ts";
-export { handleDocumentToken, handleDocumentVerify, sweepUnverified, type DocumentContext, type SweepContext } from "./docupload.ts";
-export { liveEnvelopeLogs, sweepUnreferencedEnvelopes, type EnvelopeLogs, type EnvelopeSweepContext, type EnvelopeSweepOutcome } from "./envelopeSweep.ts";
+export { handleDocumentToken, handleDocumentVerify, sweepUnverified, type DocumentContext, type DocumentSweepOutcome, type SweepContext } from "./docupload.ts";
+export { liveEnvelopeLogs, sweepUnreferencedEnvelopes, type DocumentPost, type EnvelopeLogs, type EnvelopeSweepContext, type EnvelopeSweepOutcome } from "./envelopeSweep.ts";
 export { handleRelay, type RelayContext } from "./relay.ts";
 export { ensureWindow, type WindowDeps } from "./window.ts";
 export { liveRelayer } from "./chain/live.ts";
 export { handleSponsor, liveSponsor, type SponsorChain, type SponsorContext, type SponsorLimits } from "./sponsor.ts";
-export { handleDemoChallenge, handleDemoJoin, sweepDemoGuests, type DemoContext, type DemoLimits, type DemoSweepContext, type RemovalReason, type SweepOutcome } from "./demo.ts";
+export { freeDemoSeats, handleDemoChallenge, handleDemoJoin, sweepDemoGuests, type DemoContext, type DemoLimits, type DemoSweepContext, type PressureOutcome, type RemovalReason, type SweepOutcome } from "./demo.ts";
 export { liveDemoChain, type DemoChain } from "./demoBoard.ts";

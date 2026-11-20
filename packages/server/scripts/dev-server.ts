@@ -38,8 +38,18 @@ const notConfigured = (key: string): Response => {
   return refuse(503, "not_configured");
 };
 
+/**
+ * Runs a join's background work, the demo board's pressure pass, after the join has answered, as
+ * Next.js `after` does in the app. Fire and forget: a failure is logged, never thrown at the join.
+ */
+const background = (work: () => Promise<unknown>): void => {
+  void Promise.resolve()
+    .then(work)
+    .catch(() => console.warn(JSON.stringify({ event: "dev_background_failed" })));
+};
+
 const demo = (base: HandlerContext): DemoContext | undefined =>
-  relayer === undefined ? undefined : { ...base, env, chain: demoChain, blobs, relayer: relayer.relayer, relayChain: relayer.chain };
+  relayer === undefined ? undefined : { ...base, env, chain: demoChain, blobs, relayer: relayer.relayer, relayChain: relayer.chain, background };
 
 const ROUTES: ReadonlyMap<string, Handler> = new Map<string, Handler>([
   ["/api/upload", (request, base) => handleUpload(request, { ...base, blobs, blobOrigin: env.BLOB_ORIGIN })],
