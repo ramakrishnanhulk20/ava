@@ -1,6 +1,6 @@
 # Ava architecture
 
-This page explains how Ava works, from the plain idea down to the exact calls the web app makes. Each section opens in plain English and gives the exact detail after it. Every fact here was read from the code in this repository, from the saved deployment records, or from a live read of the QoreChain testnet on 17 Nov 2026.
+This page explains how Ava works, from the plain idea down to the exact calls the web app makes. Each section opens in plain English and gives the exact detail after it. Every fact here was read from the code in this repository, from the saved deployment records, or from a live read of the QoreChain testnet on 17 Nov 2026. It was brought up to date with the code on 19 Nov 2026, after the security audit.
 
 Contents
 
@@ -184,7 +184,7 @@ sequenceDiagram
   Note over E: Keys already received still open the older packs. That is a stated non-goal
 ```
 
-Where each check happens:
+Where each check happens. Inside the registry the checks run in this order, so the first one that fails names the revert. For `addMember`: board exists, member address, already a member, board full, envelope size, mode and epoch, the new member's key (`NoPqcKey`, `WrongAlgorithm`, `PossessionNotProven`, `BadKeyLength`), then the deadline (`DeadlineExpired`, `DeadlineTooFar`), then the chair's key, then the signature (`BadSignature`, `PrecompileUnavailable`). For `transferChair`: board exists, new chair address, same chair, not a member, the new chair's key, then the same deadline, chair key and signature checks. The deadline is always checked before the chair's key. The contract's own NatSpec lists the chair's key errors first in a few places; the deployed source is left as it was built, and this page is the reference.
 
 | Check | Where it runs | What is compared | If it fails |
 |---|---|---|---|
@@ -329,11 +329,11 @@ Network: `qorechain-diana` (native chain id), EVM chain id 9800. Record: `packag
 
 Both deploy receipts were read from the public EVM JSON-RPC on 17 Nov 2026 and show status success. The deploy gas figures come from those receipts.
 
-BoardRegistry build record: Solidity `0.8.38+commit.1835d247`, EVM version `prague`, optimizer 200 runs, OpenZeppelin Contracts v5.6.1. Its runtime code hash is `0x157b97bfe8fdc2477a2326a26cee20683bf25ca44a96f98ee5c233745f844a9b`. On 17 Nov 2026 the code returned by `eth_getCode` at that address (11,274 bytes) hashed to exactly that value. The server holds the same hash as `REGISTRY_CODE_KECCAK` in `packages/server/src/config.ts`.
+BoardRegistry build record: Solidity `0.8.38+commit.1835d247`, EVM version `prague`, optimizer 200 runs, OpenZeppelin Contracts v5.6.1. Its runtime code hash is `0x157b97bfe8fdc2477a2326a26cee20683bf25ca44a96f98ee5c233745f844a9b`. On 17 Nov 2026 the code returned by `eth_getCode` at that address (11,274 bytes) hashed to exactly that value. The server holds the same hash as `REGISTRY_CODE_KECCAK` in `packages/server/src/config.ts`, and refuses to relay anything (503 `registry_mismatch`) until the code it reads at the registry address hashes to it.
 
 The registry has no owner, no admin, no pause, no upgrade path and accepts no value. Nobody, the deployer included, can change a board except its chair, and only by signature.
 
-PqcProbe is a small contract that records a digest only when the signer's registered ML-DSA-87 key signed it. It was the first proof that a deployed contract can check a real post-quantum signature with the precompiles. The product uses BoardRegistry.
+PqcProbe is a small contract that records a digest only when the signer's registered ML-DSA-87 key signed it. It was the first proof that a deployed contract can check a real post-quantum signature with the precompiles. The product uses BoardRegistry. The code deployed at the PqcProbe address (2,073 bytes) equals a fresh build of `packages/contracts/src/PqcProbe.sol` except for the last 43 bytes, the compiler's metadata trailer, which changed when comments were edited after the 16 Nov deploy. The keccak256 of the deployed code is `0xfb6fd45300bdccf12104986783d8e9b166707a697932d5513bae2f5fd1f28ff2`; the keccak256 of the current build is `0x393504663700b56c4d8edf02384be490cb0770cde062c7d215975fa15897ae2e`. Both were read on 19 Nov 2026 with `cast code` on the public EVM JSON-RPC and from `packages/contracts/out`.
 
 Source verification: Sourcify does not list chain 9800 (a lookup on 17 Nov 2026 answered `unsupported_chain`), and the explorer at https://explore.qore.network offered no source submission when the registry was deployed. To check the contract yourself, build `packages/contracts` with the pinned compiler and compare the keccak256 of the runtime code with the hash above.
 
@@ -355,9 +355,9 @@ Public addresses only. Each role is a separate account, and each holds only what
 | Role | Address | What it may do | What it cannot do |
 |---|---|---|---|
 | Deployer | `qor13gmaduk6r79q0utnt3tgcfs3ypwe86tn8292fq` / `0x8A37d6f2DA1F8a07f1735c568C2611205d93e973` | Deployed PqcProbe and BoardRegistry. Sent the transactions of the live proof run (section 7) | Control any board. The registry has no owner role |
-| Relayer | `qor1xss2hc8w33twyssdzejd7hepmd3qxgywvplhff` / `0x3420ABE0Ee8c56e2420D1664dF5F21db6203208e` | Pay the fee to submit chair-signed actions to the registry, through one EVM window scoped to the registry alone (40 transactions and 12,000 blocks per window, at most 8 QOR a day) | Act as a chair, move QOR, or call any other contract. If its window is spent outside its own recorded sends, the server halts it for the rest of that UTC day and closes the window |
+| Relayer | `qor1xss2hc8w33twyssdzejd7hepmd3qxgywvplhff` / `0x3420ABE0Ee8c56e2420D1664dF5F21db6203208e` | Pay the fee to submit chair-signed actions to the registry, through one EVM window scoped to the registry alone (40 transactions and 12,000 blocks per window). At most 20 QOR a day in all: 8 for public chair relays (1.5 for any one chair address) and 12 for the demo bot | Act as a chair, move QOR, or call any other contract. If the chain shows its key used outside its own recorded sends, the server closes the window and halts it until an operator clears the halt (`docs/security/runbook.md`) |
 | Sponsor | `qor1cwula4nakmmkqvns5r4q49gnwfgvd6ln5yrxuf` / `0xc3B9fEd67Db6f7603270a0eA0a95137250c6Ebf3` | Send each eligible new identity 0.25 QOR once, by one hybrid-signed send. At most 100 sends and 25 QOR a day | Send EVM transactions or touch a board. It refuses contract addresses, addresses that already hold a post-quantum key, and addresses holding 0.25 QOR or more |
-| Demo chair | `qor1g7rde5fszsedm7hktcxs389aa7nve63y4hpfwy` / `0x4786dCd1301432DDFaF65e0d089CbDEFA6ccEa24` | Chair of the public demo board only. Admits a guest after the guest signs a fresh challenge, and removes guests six hours after admission | Sign anything else. It is the Q-Day Drill account, so the organisers hold its classical key from 18 Nov 2026. The ML-DSA-87 key kept in server secrets is what protects it |
+| Demo chair | `qor1g7rde5fszsedm7hktcxs389aa7nve63y4hpfwy` / `0x4786dCd1301432DDFaF65e0d089CbDEFA6ccEa24` | Chair of the public demo board only. Admits a guest after the guest signs a fresh challenge, and removes guests six hours after admission, or sooner in the background when the board is nearly full | Sign anything else. It is the Q-Day Drill account, so the organisers hold its classical key from 18 Nov 2026. The ML-DSA-87 key kept in server secrets is what protects it |
 
 State on 17 Nov 2026, read from the testnet REST: the relayer and sponsor addresses are set up in the server configuration, but on chain they hold no QOR and have no registered key yet. They are funded and registered after the drill, from 19 Nov 2026 (the demo board seeding script refuses to run before that date).
 
@@ -371,7 +371,7 @@ State on 17 Nov 2026, read from the testnet REST: the relayer and sponsor addres
 | Public EVM JSON-RPC, https://evm-testnet.qore.host | KEM keys, board reads, logs, receipts | Answers browsers directly (`access-control-allow-origin: *` on a preflight, checked 17 Nov 2026). Never routed through Ava's server |
 | Blob origin, from configuration | Read ciphertext by hash. Write a document with a one-time token | A separate registrable domain. The browser builds every read URL itself from the on-chain hash |
 
-Every server answer carries `content-type: application/json`, `x-content-type-options: nosniff` and `cache-control: no-store`. A refusal is `{ "error": "<code>" }`, where the code is a short word this package chose, never an echo of the input or of an upstream message. Refusals for rate limits and busy locks also carry `retry-after` in seconds.
+Every public route requires the request header `x-ava: 1` and refuses a `Sec-Fetch-Site` that is not `same-origin`, with `403 cross_site`, before it counts anything or reads the body. A page on another site cannot add that header to a request that needs no preflight, so it cannot spend Ava's allowances through its visitors. The app sends `x-ava: 1` on every call. A body not fully read within 20 seconds is refused with `408 body_timeout`. Every server answer carries `content-type: application/json`, `x-content-type-options: nosniff` and `cache-control: no-store`. A refusal is `{ "error": "<code>" }`, where the code is a short word this package chose, never an echo of the input or of an upstream message. Refusals for rate limits and busy locks also carry `retry-after` in seconds.
 
 ### 6.2 BoardRegistry reads
 
@@ -472,20 +472,43 @@ Plus, in every body, `deadline` (a decimal string, unix seconds) and `signature`
 
 Success is `202` with `{ "txHash": "0x<64 hex characters>" }`. That hash is a claim that the transaction was handed to the node, not that it succeeded. The app marks an action done only when the receipt shows success and the registry event carries the expected nonce, and shows pending until then or until the deadline passes.
 
-What the relay does with a request, in order: it accepts POST only, applies the per-IP and total limits, checks the content type and size, parses the body against the schema above, applies the per-board limit, reads the board's chair with `getBoard` (the `create` action names the chair itself), applies the per-chair limit, then takes the shared send lock. Under the lock it checks the day's halt flag, makes sure a scoped window is open and big enough, runs `eth_call` of the exact transaction, checks the gas estimate against the action's ceiling and the fee against the cap, records the worst case against the day's ceiling, and sends once. It builds the calldata itself from the typed fields; the target is the registry address, a constant.
+What the relay does with a request, in order:
+
+1. Refuses a request a page on another site could have sent (403 `cross_site`).
+2. Accepts POST only.
+3. Checks that the code at the registry address hashes to the deployed build (503 `registry_mismatch`). The answer is kept for the life of the process.
+4. Applies the per-IP limit. An IPv6 client is also counted per /48, at four times the per-IP figure.
+5. Checks the content type and size, reads the body within 20 seconds and parses it against the schema above.
+6. For a `post`, checks the document: the size the server holds for the `cipherHash` (the verified mark) must equal the signed `cipherSize`. No verified copy answers 422 `document_unverified`, another size 422 `size_mismatch`. This is a read that moves no counter.
+7. Runs `eth_call` of the exact transaction. The registry checks the signature here, before any budget moves. A failure counts only against a separate rejected total.
+8. Sets a once-only mark on the hash of the calldata, which lives until the signed deadline. A byte-identical copy of a pending action answers 409 `duplicate` and moves no counter. The mark is removed if the relay fails before broadcast.
+9. Sets an in-flight mark on the board and nonce (for a new board, the chair and its create nonce). A second, different action at that nonce while one is in flight answers 409 `nonce_in_flight` and moves no counter. Both marks give way: once the relayer's transaction hash is known it is written into the mark, and a later action takes the mark when the chain does not know that hash or knows it as reverted. A mark with no hash yet blocks others only while its own relay is inside its 55 seconds.
+10. Reads, without counting, the per-board, per-chair and valid-action counters (reading the board's chair with `getBoard` first; the `create` action names the chair itself), so a relay already over one is refused before it waits for the lock. A demo-scope relay (the bot's own) skips these counters, because the bot takes its hourly room first with `reserveDemoRelays` (120 relays an hour).
+11. Takes the shared send lock. Under it: takes any mark whose transaction the chain does not know; checks the halt flag (on a halted day it still closes a live window first, then answers 503 `halted`); makes sure a scoped window is open and big enough; runs `eth_call` of the exact transaction again; checks the gas estimate against the action's ceiling and the fee against the cap; for a post, reserves its verified size on the chair's day (100 MiB) and the day's total (1 GiB), refusing 429 `post_bytes` past either; reserves the worst case on the chair's own day (1.5 QOR), on the chairs' or the demo bot's share, and on the relayer's 20 QOR total, all or none; checks the relayer's nonce against the one stored in shared state (if the chain is past it, every nonce in between must hold a transaction the relayer recorded and the chain holds; one that does not means the key was used elsewhere, so it halts and closes the window); checks the send cutoff again; only then counts the per-board, per-chair and valid-action totals (last, because they cannot be given back, so a relay refused by the nonce check or the cutoff counts nothing); records the hash of the signed transaction under its nonce and writes it into both marks; and sends once with the action's gas ceiling as the gas limit. The stored nonce moves forward later, by compare-and-set, only when that hash is seen on chain.
+The totals move once per action: the first relay of a given calldata writes a mark (`relay:counted:<keccak256 of the calldata>`) that lives until the signed deadline plus 600 seconds, and a byte-identical relay that returns after the first send was lost finds it and counts nothing again.
+
+12. After the lock, waits up to 15 seconds for the receipt and settles each reservation down to the real fee (gas used times effective gas price) and clears the in-flight mark. With no receipt the worst case stays booked.
+
+It builds the calldata itself from the typed fields; the target is the registry address, a constant.
 
 Relay refusals:
 
 | Status | `error` | Meaning |
 |---|---|---|
+| 403 | `cross_site` | No `x-ava: 1`, or a `Sec-Fetch-Site` other than `same-origin` |
 | 405 | `method_not_allowed` | Not POST |
 | 415 | `json_only` | Content type is not `application/json` |
 | 413 | `body_too_large` | Over 16,384 bytes |
+| 408 | `body_timeout` | The body was not complete within 20 seconds |
 | 400 | `bad_body` | Fails the schema, including a signature that is not 4,627 bytes |
-| 429 | `rate_limited` | Per IP, per board, per chair or in total. `retry-after` is set |
+| 409 | `duplicate` | A byte-identical copy of a pending action. Nothing was counted |
+| 409 | `nonce_in_flight` | A different action is already in flight at this board and nonce. Nothing was counted |
+| 429 | `rate_limited` | Per IP, per board, per chair, in total, or the chair's 1.5 QOR day. `retry-after` is set |
+| 429 | `post_bytes` | A post would take the chair past 100 MiB of posted documents in the UTC day, or all chairs past 1 GiB. The size counted is the verified one. `retry-after` is set |
+| 422 | `document_unverified`, `size_mismatch` | A post names a document the server holds no verified copy of, or one of another size than the signed `cipherSize`. Nothing was counted or sent |
 | 422 | A registry error name, `reverted`, or `gas_above_ceiling` | The exact transaction would revert, or costs more than the action's gas ceiling. Nothing was sent |
 | 502 | `chain_unreachable`, `broadcast_failed` | The chain could not be read, or the send failed |
-| 503 | `busy`, `out_of_time`, `halted`, `daily_ceiling`, `window_unavailable`, `fee_above_ceiling`, `ledger_unavailable`, `store_unavailable` | The relay cannot serve this request now. `busy` and `out_of_time` carry `retry-after: 30` |
+| 503 | `registry_mismatch`, `busy`, `out_of_time`, `halted`, `daily_ceiling`, `window_unavailable`, `fee_above_ceiling`, `ledger_unavailable`, `store_unavailable` | The relay cannot serve this request now. `busy` and `out_of_time` carry `retry-after: 30` |
 
 Gas ceilings per action, set in `packages/server/src/config.ts`: create 650,000, add 560,000, remove 450,000, rotate 450,000, post 500,000, transfer 450,000. Fee cap: 250 gwei.
 
@@ -506,6 +529,8 @@ Browsers cannot call the REST directly, so reads and registrations go through he
 | `GET /cosmos/tx/v1beta1/txs/{hash}` | A transaction by hash (64 hex characters) |
 | `GET /cosmos/base/tendermint/v1beta1/blocks/latest` | Latest block (see section 8 for its size caveat) |
 | `GET /cosmos/base/tendermint/v1beta1/node_info` | Node info |
+| `GET /qorechain/pqc/v1/protocol_features` | Which sign-bytes forms the chain has enabled. The SDK reads it to pick the hybrid form |
+| `GET /cosmos/upgrade/v1beta1/applied_plan/{name}` | Whether a named upgrade has been applied. The SDK reads it for the same choice |
 | `POST /cosmos/tx/v1beta1/simulate` | Body `{ "tx_bytes": "<base64>" }` |
 | `POST /cosmos/tx/v1beta1/txs` | Body `{ "tx_bytes": "<base64>", "mode": "BROADCAST_MODE_SYNC" }`, and nothing else |
 
@@ -515,13 +540,13 @@ Refusals: 405 `method_not_allowed`, 429 `rate_limited`, 400 `query_not_allowed`,
 
 #### Envelope upload: `POST /api/upload?kind=envelope`
 
-Request: the raw envelope bytes as the body, up to 110,000 bytes. The query must be exactly `?kind=envelope`. The content type and any name the client suggests are ignored. Response `201` for a new blob or `200` when the same bytes were already stored: `{ "sha256": "<64 lowercase hex>", "size": <bytes>, "url": "<blob origin>/envelope/<sha256>" }`. The URL is checked against that form before it is returned, because the chair signs the hash and the chain keeps it for good.
+Request: the raw envelope bytes as the body, up to 110,000 bytes. The query must be exactly `?kind=envelope`, and the content type must be exactly `application/octet-stream`. Any name the client suggests is ignored. Response `201` for a new blob or `200` when the same bytes were already stored: `{ "sha256": "<64 lowercase hex>", "size": <bytes>, "url": "<blob origin>/envelope/<sha256>" }`. The URL is checked against that form before it is returned, because the chair signs the hash and the chain keeps it for good.
 
-Limits per hour: 20 per IP, 200 in total, and per IP the bytes of 20 maximum-size envelopes. Refusals: 405 `method_not_allowed`, 429 `rate_limited` or `byte_budget_spent`, 400 `bad_kind`, `empty_body` or `bad_body`, 413 `body_too_large`, 500 `server_misconfigured`, 502 `store_failed` or `unexpected_blob_url`.
+Limits per hour: 20 per IP, 1,000 in total, and per IP the bytes of 20 maximum-size envelopes (2.2 MB). An IPv6 client is also counted per /48 at four times each figure. An envelope the chain never names is deleted two hours after its upload, so upload it right before the chair signs. Refusals: 403 `cross_site`, 405 `method_not_allowed`, 415 `content_type`, 429 `rate_limited` or `byte_budget_spent`, 400 `bad_kind`, `empty_body` or `bad_body`, 413 `body_too_large`, 500 `server_misconfigured`, 502 `store_failed` or `unexpected_blob_url`.
 
 #### Document upload token: `POST /api/document/token`
 
-Request `{ "sha256": "<64 lowercase hex>" }` as `application/json`, at most 256 bytes. Response `200` either `{ "exists": true, "url": "<blob origin>/document/<sha256>" }` (skip the upload and verify) or:
+Request `{ "sha256": "<64 lowercase hex>", "size": <bytes> }` as `application/json`, at most 256 bytes. `size` is the ciphertext's length, a whole number from 1 to 26,214,400. Response `200` either `{ "exists": true, "url": "<blob origin>/document/<sha256>" }` (skip the upload and verify) or:
 
 ```json
 {
@@ -529,16 +554,16 @@ Request `{ "sha256": "<64 lowercase hex>" }` as `application/json`, at most 256 
   "pathname": "document/<sha256>",
   "token": "vercel_blob_client_...",
   "contentType": "application/octet-stream",
-  "maxBytes": 26214400,
+  "maxBytes": 1048576,
   "validUntil": 1794900600000
 }
 ```
 
-The token allows one write: exactly that pathname, `application/octet-stream` only, at most 26,214,400 bytes, never over an existing blob, for ten minutes. The browser then calls `put` from `@vercel/blob/client` with `{ access: "public", token, contentType }` and the ciphertext. Limits per hour: 30 requests per IP, 150 in total, 12 tokens per IP. Refusals: 405, 415 `json_only`, 413, 400 `bad_body` or `bad_sha256`, 429 `rate_limited` or `token_budget_spent`, 500 `server_misconfigured` or `token_failed`, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`.
+The token allows one write: exactly that pathname, `application/octet-stream` only, exactly the declared `size` (`maxBytes` equals it; the example shows a 1 MiB file), never over an existing blob, for ten minutes. The size is booked before the token is issued on three daily budgets: 25 MiB per client, four times that per IPv6 /48, and 1,250 MiB in total. Past any of them, 429 `upload_bytes` and no token, and a refused request books nothing, so the store can grow by at most 1,250 MiB a day however a document is later posted. A token whose name is still empty 10 minutes after issue plus a 1 hour grace gives its bytes back once. An existing pathname answers `exists: true` and books nothing. The browser then calls `put` from `@vercel/blob/client` with `{ access: "public", token, contentType }` and the ciphertext. Limits per hour: 30 requests per IP, 1,500 in total, 12 tokens per IP (a /48 gets four times the per-IP figures). Refusals: 405, 415 `json_only`, 413, 400 `bad_size`, `bad_body` or `bad_sha256`, 429 `rate_limited`, `token_budget_spent` or `upload_bytes`, 500 `server_misconfigured` or `token_failed`, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`.
 
 #### Document verify: `POST /api/document/verify`
 
-Request as for the token. The server reads the stored bytes back from the blob origin (at most 26,214,400 bytes, 30 seconds), hashes them, and keeps the blob only if the hash is its name. Response `200` `{ "sha256", "size", "url" }`. Run it after every upload and before the chair signs. Refusals that delete the blob: 409 with `error` set to `blob_missing`, `too_large`, `empty`, `hash_mismatch` or `too_old` (unverified for over 50 minutes). Refusals that do not: 405, 415, 413, 400, 429, 500, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`, 504 `verify_timeout`. Limits per hour: 30 per IP, 150 in total.
+Request as for the token. The server reads the stored bytes back from the blob origin (at most 26,214,400 bytes, 30 seconds), hashes them, and keeps the blob only if the hash is its name. Response `200` `{ "sha256", "size", "url" }`. The size it read back is stored in the hash's verified mark, and the relay refuses a post whose `cipherSize` differs from it. Run it after every upload and before the chair signs, and post the document soon after. Whether or not it was verified, a document that no `DocumentPosted` event names is deleted two hours after its upload, so a document posted later than that is gone before it can be read. Refusals that delete the blob: 409 with `error` set to `blob_missing`, `too_large`, `empty`, `hash_mismatch` or `too_old` (unverified for over 50 minutes). Refusals that do not: 405, 415, 413, 400, 429, 500, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`, 504 `verify_timeout`. Limits per hour: 30 per IP, 1,500 in total.
 
 #### Relay: `POST /api/relay`
 
@@ -564,17 +589,35 @@ The public demo board admits a guest only after the guest proves it holds a regi
 }
 ```
 
-The guest signs `message` with `signAction`. The app should also rebuild the bytes itself with `challengeMessage` and refuse an answer that differs. One live challenge exists per guest; asking again within 300 seconds returns the same one. Limits per hour: 10 per IP and 600 in total. Refusals: 405, 503 `not_ready` (the demo board is not seeded yet), 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 503 `store_unavailable` or `busy`.
+The guest signs with `signChallenge`, which builds the 224 bytes itself from the registry, board id, guest address, `botNonce` and `expiry`. The app never signs the `message` field as bytes: it rebuilds the bytes from the other fields and refuses an answer whose `message` differs. One live challenge exists per guest; asking again within 300 seconds returns the same one. Limits per hour: 10 per IP and 1,000 in total. Refusals: 405, 503 `not_ready` (the demo board is not seeded yet), 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 503 `store_unavailable` or `busy`.
 
 #### Demo board join: `POST /api/demo/join`
 
-Request `{ "guest": "<address>", "botNonce": "0x<64 hex>", "expiry": "<decimal>", "signature": "0x<9254 hex>" }`, at most 16,384 bytes. Any other field is dropped unread. Response `202` `{ "txHash": "0x<64 hex characters>" }`, a claim the app confirms on chain like any relayed action. The bot reads the stored challenge once and deletes it, checks the guest's key with `pqcKeyStatus`, verifies the signature, opens the current epoch key only after the hash check, seals it to the guest alone with the key `qor_getKEMKey` returns, uploads the envelope, signs `addMember` in `SEAL_CURRENT` mode and relays it. One admission per address, ever. Limits: 3 per IP per hour, 200 a day, and a board cap of 40 members.
+Request `{ "guest": "<address>", "botNonce": "0x<64 hex>", "expiry": "<decimal>", "signature": "0x<9254 hex>" }`, at most 16,384 bytes. Any other field is dropped unread. Response `202` `{ "txHash": "0x<64 hex characters>" }`, a claim the app confirms on chain like any relayed action. A join is one `addMember` and never removes anyone.
 
-Refusals: 405, 503 `not_ready`, 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 409 `no_challenge`, `already_admitted`, `already_member` or `board_full`, 403 `challenge_mismatch`, `challenge_expired`, `no_proven_key`, `bad_signature` or `no_kem_key`, 502 `chain_unreachable`, `kem_unavailable`, `envelope_unavailable`, `envelope_mismatch`, `upload_failed`, `upload_mismatch`, `reverted` or `join_failed`, 503 `daily_limit`, `store_unavailable`, `busy`, `not_chair`, `chair_not_recipient` or `out_of_time`, and `relay_<code>` when the relay inside refuses (the relay's own code after the prefix).
+The join sequence, in order:
+
+0. Before the body is read, the challenge used or anything counted, the server checks whether the board holds 40 members, from a board size at most 5 seconds old (so a flood of joins costs the chain one read every few seconds). A full board answers 503 `board_full` with `retry-after: 30`. That counts against nothing: the guest, the day, the hour and the per-IP join count are untouched, the challenge stays valid for the retry, and the bot schedules a background pressure pass (below).
+1. The bot checks the guest's key with `pqcKeyStatus` and the signature. From then on, every refusal the guest caused counts against its address for the UTC day, and the sixth answers 429 `too_many_failures`. A refusal that is the service's own (any 5xx or 429) never counts.
+2. It reads the stored challenge once and deletes it, looks up and validates the guest's ML-KEM key, and refuses a guest whose ML-KEM key equals a current member's (403 `key_shared`); a member whose lookup is unreadable is skipped. None of this moves a counter.
+3. It takes the join lock and the once-per-address mark (150 seconds), and reads the board again. A board that filled since step 0 answers 503 `board_full` here too, takes the mark back and counts nothing, but this join has already used its challenge, so the app asks for a fresh one. A mark whose add the chain does not know, or knows as reverted, while the guest is not a member, is released here and the join goes on. A mark whose add is still pending, whose standing cannot be read, or that a join still under way holds, answers 503 `admission_unsettled` (retry-after 30), keeps the mark and counts nothing.
+4. Otherwise it takes one of this hour's demo relays (`reserveDemoRelays`, 120 an hour; 503 `demo_busy` if none is left), opens the current epoch key only after the hash check, seals it to the guest alone with the key `qor_getKEMKey` returns, and uploads the envelope.
+5. It signs `addMember` in `SEAL_CURRENT` mode, takes the join from the day (120 a day) and makes the once-per-address mark permanent, relays the action and waits up to 30 seconds for the receipt. If the board now holds more than 34 members, it schedules a pressure pass.
+
+The pressure pass (`freeDemoSeats`) is the background half. The board keeps six seats free (40 minus `DEMO_FREE_SEATS`). The pass removes guests, one relay each with its own hourly reservation, until 34 members remain: a guest with a key problem first, otherwise the oldest. It stops at the first refusal, at a removal whose receipt was not seen, or after six removals, and a refused removal changes nothing for any guest. Each removal reads a fresh clock, so a pass that runs past the top of an hour books its next removal in the new hour. Where the host gives the handlers a `background` runner the pass runs after the answer is sent; where it does not, the scheduled `sweepDemoGuests` run does the work, because after its own step it runs the same pass while the board holds more than 34 members. One admission per address, ever; the mark is released only if the board shows the guest is not a member. Limits: 3 per IP per hour, 120 a day, and a board cap of 40 members.
+
+Refusals: 405, 503 `not_ready`, 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 409 `no_challenge`, `already_admitted` or `already_member`, 403 `challenge_mismatch`, `challenge_expired`, `no_proven_key`, `bad_signature`, `no_kem_key`, `bad_kem_key` or `key_shared`, 429 `too_many_failures`, 502 `chain_unreachable`, `kem_unavailable`, `envelope_unavailable`, `envelope_mismatch`, `upload_failed`, `upload_mismatch`, `reverted` or `join_failed`, 503 `board_full` (retry-after 30), `admission_unsettled` (retry-after 30), `daily_limit`, `demo_busy`, `store_unavailable`, `busy`, `not_chair`, `chair_not_recipient` or `out_of_time`, 408 `body_timeout`, 403 `cross_site`, and `relay_<code>` when the relay inside refuses (the relay's own code after the prefix).
 
 #### Scheduled work, not HTTP routes
 
-Two functions are exported for a schedule: `sweepUnverified` deletes document blobs older than one hour that were never verified (at most 5,000 per run), and `sweepDemoGuests` removes at most one demo guest per call, the one admitted longest ago and at least six hours ago. The seeded directors and the chair are never removed.
+Four functions are exported for a schedule, and nothing deletes anything until the host calls them.
+
+- `sweepUnreferencedEnvelopes` (`envelopeSweep.ts`) reads the registry's logs from a cursor, marks every envelope hash (`referenced:<registry>:<sha256>`, the registry address in the name) and every posted document hash (`posted:<registry>:<sha256>`, carrying the `cipherSize` the event named), records how far it has read (`docsweep:marked-through:<registry>`), and deletes envelope blobs older than two hours that no event names. Run it about every 30 minutes.
+- `sweepUnverified` (`docupload.ts`) deletes document blobs older than two hours that no `DocumentPosted` event names, and only blobs the scan has read past; it also deletes any non-hash name under `document/` after one hour. A posted blob whose stored size differs from the size its posted mark records is deleted (`document_size_mismatch`). A posted blob that was never verified is hashed once: a match gets its verified mark, a mismatch is deleted (`document_mismatch_deleted`), and one that cannot be read is logged (`document_read_failed`) and kept. It keeps its place in the blob listing between runs (`docsweep:cursor`, moved by compare-and-set) so it reaches every name. A listing the store refuses while a cursor is held resets the cursor to the start. The sweep runs under a lock (`docsweep:lock`, 300 seconds, no waiting), so a second run answers `busy`. It hashes at most 200 MiB a run, starts no new read or page after 240 seconds, and returns `{ deleted, deferred, unreadable, outOfTime }`. Run it after the envelope scan.
+- `sweepDemoGuests` removes at most one demo guest per call, the one admitted longest ago and at least six hours ago, or one whose key is missing, invalid, changed, shared with another member (`key_shared`) or unreadable on three sweeps in a row (`key_unreadable`). Its removal reasons are `expired`, `key_missing`, `key_invalid`, `key_changed`, `key_shared`, `key_unreadable` and `pressure`. The seeded directors and the chair are never removed. It then runs a pressure pass while the board holds more than 34 members, and settles admission marks whose add never landed (an admission mark names its add's transaction; one the chain does not know or knows as reverted, for a guest who is not a member, is released). Run it every few minutes.
+- `freeDemoSeats` is the pressure pass described under the join. The join schedules it through the host's `background` runner; also run it on the schedule as a backstop, so a board that fills is freed even if a background run was lost. It removes with the reason `pressure`, or the key reason for a guest with a key problem.
+
+The shared store must run with eviction off, because every keep decision is a mark in it.
 
 ### 6.5 Reads straight from the public EVM JSON-RPC
 
@@ -582,7 +625,7 @@ Post JSON-RPC to https://evm-testnet.qore.host. Allowed methods used by the code
 
 | Method | Use |
 |---|---|
-| `qor_getKEMKey` with params `["0x<20-byte address>"]` | A director's ML-KEM-1024 key. Result fields: `found` (boolean), `address`, `algorithm_id` (2), `public_key` (`0x` hex, 1,568 bytes). Use `fetchKemKey` from `@ava/core`, which checks all of it |
+| `qor_getKEMKey` with params `["0x<20-byte address>"]` | A director's ML-KEM-1024 key. Result fields: `found` (boolean), `address`, `algorithm_id` (2), `public_key` (`0x` hex, 1,568 bytes). Use `fetchKemKey` from `@ava/core`, which checks all of it and returns the account and its key as one pair, the only source `sealEpochKey` accepts. Never list one key under two accounts: a seal refuses it |
 | `eth_call` to the registry | The reads in section 6.2 |
 | `eth_call` to `0x0000000000000000000000000000000000000a02` | `pqcKeyStatus(address account) returns (bool registered, uint8 algorithmId, bytes pubkey, bool possessionProven)`. Treat fewer than 160 bytes of answer as an inactive precompile |
 | `eth_getLogs` filtered to the registry | History and the exposure ledger. A failed, timed-out or cut-short read must show "incomplete" |
@@ -596,17 +639,18 @@ The library is the browser's toolkit and the server's. All of it is exported fro
 
 ```ts
 generateMnemonic(): string
+canonicalPhrase(raw: string): string
 identityFromMnemonic(mnemonic: string): Promise<Identity>
 newBoardRef(): Uint8Array
 newDocRef(): Uint8Array
-newEpochKey(): Uint8Array
+newEpochKey(): FreshEpochKey
 placeOf(registry: string, boardRef: Bytes32): Uint8Array
 purposeFor(registry: string, boardRef: Bytes32, epoch: Uint): string
-sealEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Uint; epochKey: Uint8Array; recipients: SealRecipientAccount[] }): Uint8Array
-openEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Uint; envelope: Uint8Array; expectedHash: Bytes32; expectedSize: Uint; sealKeys: SealKeyPair }): Uint8Array
-encryptDocument(p: DocumentPlace & { plaintext: Uint8Array }): Promise<Uint8Array>
+sealEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Uint; epochKey: OpenedEpochKey | FreshEpochKey; recipients: KemRecipient[] }): Uint8Array
+openEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Uint; envelope: Uint8Array; expectedHash: Bytes32; expectedSize: Uint; sealKeys: SealKeyPair }): OpenedEpochKey
+encryptDocument(p: DocumentPlace & { epochKey: OpenedEpochKey; plaintext: Uint8Array }): Promise<Uint8Array>
 decryptDocument(p: DocumentPlace & { ciphertext: Uint8Array; expectedHash: Bytes32; expectedSize: Uint }): Promise<Uint8Array>
-fetchKemKey(address: string, opts: { rpc?: string; timeoutMs?: number } = {}): Promise<Uint8Array>
+fetchKemKey(address: string, opts: { timeoutMs?: number } = {}): Promise<KemRecipient>
 paramsCreate(p: { chair: string; boardRef: Bytes32; envelopeHash: Bytes32; envelopeSize: Uint }): Hex
 paramsAdd(p: { member: string; mode: Mode; envelopeHash: Bytes32; envelopeSize: Uint; epochAfter: Uint }): Hex
 paramsRemove(p: { member: string; envelopeHash: Bytes32; envelopeSize: Uint; epochAfter: Uint }): Hex
@@ -616,6 +660,8 @@ paramsTransfer(p: { newChair: string }): Hex
 actionMessage(p: { registry: string; action: Action; boardId: Uint; paramsHash: Bytes32; nonce: Uint; deadline: Uint }): Uint8Array
 challengeMessage(p: { registry: string; boardId: Uint; guest: string; botNonce: Bytes32; expiry: Uint }): Uint8Array
 deadlineFrom(latestBlockTimestamp: Uint, seconds: Uint): bigint
+signBoardAction(mldsaSecretKey: Uint8Array, p: BoardActionInput & { registry: string; boardId: Uint; nonce: Uint; deadline: Uint; latestBlockTimestamp: Uint }): { message: Uint8Array; paramsHash: Hex; signature: Uint8Array }
+signChallenge(mldsaSecretKey: Uint8Array, p: { registry: string; boardId: Uint; guest: string; botNonce: Bytes32; expiry: Uint; latestBlockTimestamp: Uint }): { message: Uint8Array; signature: Uint8Array }
 signAction(mldsaSecretKey: Uint8Array, message: Uint8Array): Uint8Array
 verifyAction(publicKey: Uint8Array, message: Uint8Array, signature: Uint8Array): boolean
 sha256(bytes: Uint8Array): Uint8Array
@@ -629,7 +675,7 @@ sameAccount(a: string | Uint8Array, b: string | Uint8Array): boolean
 
 `DocumentPlace` is `{ epochKey: Uint8Array; registry: string; boardRef: Bytes32; epoch: Uint; docRef: Bytes32 }`. `Identity` holds `account`, `qor1`, `evm`, `privateKey`, `mldsa` (the ML-DSA-87 key pair that signs board actions) and `seal` (the ML-KEM-1024 and X25519 key pair). It carries secrets: never log, send or serialise it.
 
-Errors to handle: `HashMismatch`, `EnvelopeError`, `DocumentError`, `ActionError`, `AddressError`, `KemKeyUnavailable` (with `reason`: `NOT_FOUND`, `WRONG_ACCOUNT`, `WRONG_ALGORITHM`, `INVALID_KEY`, `MALFORMED`, `TIMEOUT`, `NETWORK`), and QoreSeal's `NOT_A_RECIPIENT` and `DECRYPTION_FAILED`. `signAction` signs only 256 bytes under the board tag or 224 bytes under the challenge tag, and refuses anything else, because the same key also signs chain transactions.
+Errors to handle: `HashMismatch`, `EnvelopeError`, `DocumentError`, `ActionError`, `AddressError`, `KemKeyUnavailable` (with `reason`: `NOT_FOUND`, `WRONG_ACCOUNT`, `WRONG_ALGORITHM`, `INVALID_KEY`, `MALFORMED`, `TIMEOUT`, `NETWORK`), and QoreSeal's `NOT_A_RECIPIENT` and `DECRYPTION_FAILED`. `signBoardAction` and `signChallenge` are what application code calls. Each rebuilds the bytes from typed fields, ignores any `message` or `paramsHash` it is handed, and refuses a deadline or expiry that is not 1 to 3,600 seconds after `latestBlockTimestamp` (take that from the latest block, never the device clock). `signAction` signs any 256 bytes under the board tag or 224 bytes under the challenge tag and refuses everything else, because the same key also signs chain transactions; it is for scripts and the attack suite. `OpenedEpochKey`, `FreshEpochKey` and `KemRecipient` are compile-time brands: only `openEpochKey` makes the first, only `newEpochKey` the second and only `fetchKemKey` the third. A document is encrypted only under a key opened from an on-chain envelope. `canonicalPhrase` is the one place a recovery phrase is normalised; every key derivation reads its output, so a phrase pasted with odd spacing gives the same account and keys.
 
 ### 6.7 Onboarding a new identity
 
@@ -641,7 +687,7 @@ The steps the demo seeding script follows (`onboard` in `packages/server/scripts
 4. Register the ML-KEM-1024 key: `MsgRegisterKEMKey`, signed in hybrid mode, fee 67,500 uqor for 450,000 gas. Confirm with `qor_getKEMKey`.
 5. Confirm on the EVM lane that `pqcKeyStatus` shows the key registered and proven, since BoardRegistry refuses any member without that.
 
-One caution on step 4. The SDK's automatic choice of the hybrid sign-bytes form calls two REST routes, `/qorechain/pqc/v1/protocol_features` and `/cosmos/upgrade/v1beta1/applied_plan/{name}`, and the proxy does not serve either. Pass the sign-bytes version to the signer explicitly. On 17 Nov 2026 the testnet's `protocol_features` lists `pqc-sign-bytes-v2` as enabled, which means `"v2"`.
+One note on step 4. The SDK's automatic choice of the hybrid sign-bytes form calls two REST routes, `/qorechain/pqc/v1/protocol_features` and `/cosmos/upgrade/v1beta1/applied_plan/{name}`, and the proxy serves both. Passing the sign-bytes version to the signer explicitly is still the safer choice, since it removes two reads from the path. On 17 Nov 2026 the testnet's `protocol_features` lists `pqc-sign-bytes-v2` as enabled, which means `"v2"`.
 
 ### 6.8 Rules the web app keeps
 
@@ -654,9 +700,12 @@ These come from `docs/security/threat-model.md` section C. Each is a promise the
 | Compare accounts as 20 bytes with the shared codec, never as strings | C16 |
 | Seal a rotation to exactly the members read in the same block as the nonce | C17 |
 | Keep the phrase, secret keys, epoch keys and passphrase inside the browser | C18 |
+| Normalise a pasted recovery phrase with `canonicalPhrase` before any key is derived | C16 |
+| Sign only through `signBoardAction` and `signChallenge`, never bytes a server supplied. Encrypt only under a key opened from an on-chain envelope | C12, C45 |
+| Send `x-ava: 1` on every call to Ava's server | C23 |
 | Render every chain string and every decrypted document as text. Preview only in a sandboxed frame for types detected from the bytes. Everything else downloads under a cleaned filename | C19, C20 |
 | Label a board from a stranger with its chair and id, and fetch nothing from it until the user opens it | C21 |
-| Treat a relay `txHash` as a claim until the receipt and the event confirm it | C26 |
+| Treat a relay `txHash` as a claim until the receipt and the action's own event (matched on board id and nonce, never `EnvelopeGranted`) confirm it. To cancel, land another action at that nonce | C26 |
 | Build blob URLs from the on-chain hash and the configured origin, and stop a download at the on-chain size | C30 |
 | The exposure ledger shows "incomplete" rather than a partial list | C38, C39 |
 
@@ -677,7 +726,7 @@ Source: the saved live proof run `packages/contracts/deployments/prove-registry-
 - Total spent in the run: 0.532464 QOR realised (the deployer's balance went from 2.792261 to 2.259797 QOR). The seven window opens cost 0.257553 QOR and the seven registry writes 0.274915 QOR. Nothing is unrealised and no QOR is held anywhere.
 - Deployment: BoardRegistry 2,490,970 gas, PqcProbe 501,447 gas (both from their receipts).
 - `rotateEpoch` and `transferChair` have Foundry tests but are not in the saved live run, so they have no measured gas. The relayer's ceilings for them (450,000 each) are set from the nearest measured actions.
-- What the server budgets, from `packages/server/src/config.ts`: the relayer's day ceiling is 8 QOR; one full window is capped at 40 worst-case transactions, 6.5 QOR (40 times 0.1625 QOR); a window open is sent with an 80,000 uqor fee. The sponsor sends 0.25 QOR per identity with a 0.06 QOR send fee, and its day cap is 25 QOR.
+- What the server budgets, from `packages/server/src/config.ts`: the relayer's day ceiling is 20 QOR (8 for public chairs, at most 1.5 of it for one chair address, and 12 for the demo bot), each send booked at its worst case and settled to its receipt's real fee; one full window is capped at 40 worst-case transactions, 6.5 QOR (40 times 0.1625 QOR); a window open is sent with an 80,000 uqor fee. The sponsor sends 0.25 QOR per identity with a 0.06 QOR send fee, and its day cap is 25 QOR.
 - Registering an identity's two keys is paid from that 0.25 QOR. The fees the code sets are 100,000 uqor for the ML-DSA-87 key and 67,500 uqor for the ML-KEM-1024 key. The ML-KEM figure is a set fee, not a measurement on this chain.
 
 ## 8. Limits and non-goals
@@ -688,8 +737,8 @@ Product limits, from the contract and `packages/core/src/constants.ts`:
 
 | Limit | Value |
 |---|---|
-| Members per board | 64 (the demo board stops at 40) |
-| Envelope size | 110,000 bytes. An envelope to 64 members is about 104,500 bytes: 56 bytes of header plus 1,632 bytes per recipient plus the payload |
+| Members per board | 64 (the demo board stops at 40 and keeps six seats free in the background) |
+| Envelope size | 110,000 bytes. An envelope to 64 members is 104,545 bytes: 56 bytes of header, plus 1,632 bytes per recipient, plus a 41-byte payload (56 + 1,632 x 64 + 41). The contract's own NatSpec says 104,568 (a 64-byte payload); the deployed source is left as it was built |
 | Pack (document ciphertext) size | 26,214,400 bytes (25 MiB) |
 | Signature deadline | At most 3,600 seconds after the latest block |
 | Signature size | 4,627 bytes. Message size 256 bytes. Challenge size 224 bytes |
@@ -699,9 +748,9 @@ Hosting limits:
 
 - The host refuses request bodies above about 4.5 MB. A pack can be 25 MiB, so packs go from the browser straight to the blob store under a one-time token for exactly one pathname, and the server then re-reads the stored bytes, hashes them and deletes them on any mismatch. Envelopes are small (at most 110,000 bytes) and go through the server so it can hash what it receives.
 - Serverless functions stop at about 60 seconds. The relay and sponsor work to a 55 second budget, the shared locks last 60 seconds, and a demo join works to a 120 second deadline under a 150 second lock. Such a request can answer `out_of_time` with `retry-after`.
-- The public REST publishes no per-IP budget. The proxy keeps all users together under 5 requests a second (300 a minute) and 60 a minute per client, so one heavy client cannot use up the quota for everyone.
+- The public REST publishes no per-IP budget. The proxy keeps all users together under 5 requests a second (300 a minute) and 60 a minute per client, so one heavy client cannot use up the quota for everyone. An IPv6 client is also counted per /48.
 - The proxy's `blocks/latest` route can return a body over its 1 MiB cap. Read the latest block time from the public EVM JSON-RPC instead.
-- The proxy does not serve the two REST routes the SDK uses to pick the hybrid sign-bytes form (section 6.7).
+- Blobs live for two hours unless the chain names them. An envelope or a document with no `EnvelopeGranted` or `DocumentPosted` event naming its hash is deleted two hours after its upload, so upload right before signing, and post a document right after verifying it. This needs the sweeps to be scheduled (section 6.4).
 - The registry source is not shown on a block explorer or Sourcify (section 5). The runtime code hash is the check.
 
 Everything stored by Ava on the blob store is public. Anyone can fetch an envelope or a pack, but without a member's key it is unreadable. Confidentiality rests on the keys held in browsers, on how those keys are handed out, and on the order in which changes land on chain.
