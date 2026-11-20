@@ -1,5 +1,5 @@
 import { bytesToHex, encodeAbiParameters, hexToBytes, keccak256, type Address, type Hex } from "viem";
-import { accountBytes, toHex } from "./address.ts";
+import { accountBytes, accountBytesStrict, toHex } from "./address.ts";
 import { Action, BOARD_TAG, CHALLENGE_TAG, EVM_CHAIN_ID, MAX_CIPHER_SIZE, MAX_DEADLINE_AHEAD, MAX_ENVELOPE_SIZE, Mode } from "./constants.ts";
 import { toBytes32, toUint, type Bytes32, type Uint } from "./values.ts";
 
@@ -30,10 +30,18 @@ function bytes32(value: Bytes32, what: string): Hex {
 }
 
 /** Decodes through the shared address codec and refuses the zero account, which no one can sign for. */
-function account(input: string, what: string): Address {
-  const bytes = accountBytes(input);
+function account(input: string, what: string, decode: (input: string) => Uint8Array = accountBytes): Address {
+  const bytes = decode(input);
   if (bytes.every((b) => b === 0)) throw new ActionError(`${what} must not be the zero address.`);
   return toHex(bytes);
+}
+
+/**
+ * A person a chair names in a signed action (threat model C16). Strict, because an all-lowercase
+ * 0x address carries no checksum and a typo in it would grant a board to an account nobody holds.
+ */
+function person(input: string, what: string): Address {
+  return account(input, what, accountBytesStrict);
 }
 
 function envelopeSize(value: Uint): number {
@@ -56,32 +64,50 @@ function mode(value: Mode): number {
 /**
  * CREATE: `keccak256(abi.encode(address chair, bytes32 boardRef, bytes32 envelopeHash, uint32 envelopeSize))`.
  * boardRef comes from newBoardRef and is the board's identity for all encryption.
+ *
+ * @param p.chair `qor1...` or exact EIP-55 `0x...`; all-lowercase `0x` is refused (threat model C16).
+ * @throws AddressError for a chair in any other form. ActionError for the zero chair, a zero or
+ *   malformed boardRef or envelopeHash, or an envelopeSize outside 1 to MAX_ENVELOPE_SIZE.
  */
 export function paramsCreate(p: { chair: string; boardRef: Bytes32; envelopeHash: Bytes32; envelopeSize: Uint }): Hex {
   return keccak256(
     encodeAbiParameters(
       [{ type: "address" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint32" }],
-      [account(p.chair, "chair"), bytes32(p.boardRef, "boardRef"), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize)],
+      [person(p.chair, "chair"), bytes32(p.boardRef, "boardRef"), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize)],
     ),
   );
 }
 
-/** ADD: `keccak256(abi.encode(address member, uint8 mode, bytes32 envelopeHash, uint32 envelopeSize, uint64 epochAfter))`. */
+/**
+ * ADD: `keccak256(abi.encode(address member, uint8 mode, bytes32 envelopeHash, uint32 envelopeSize, uint64 epochAfter))`.
+ *
+ * @param p.member `qor1...` or exact EIP-55 `0x...`; all-lowercase `0x` is refused (threat model C16).
+ * @throws AddressError for a member in any other form. ActionError for the zero member, a mode
+ *   other than SEAL_CURRENT or ROTATE, a zero or malformed envelopeHash, an envelopeSize outside 1
+ *   to MAX_ENVELOPE_SIZE, or an epochAfter outside uint64.
+ */
 export function paramsAdd(p: { member: string; mode: Mode; envelopeHash: Bytes32; envelopeSize: Uint; epochAfter: Uint }): Hex {
   return keccak256(
     encodeAbiParameters(
       [{ type: "address" }, { type: "uint8" }, { type: "bytes32" }, { type: "uint32" }, { type: "uint64" }],
-      [account(p.member, "member"), mode(p.mode), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize), uint(p.epochAfter, 64, "epochAfter")],
+      [person(p.member, "member"), mode(p.mode), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize), uint(p.epochAfter, 64, "epochAfter")],
     ),
   );
 }
 
-/** REMOVE: `keccak256(abi.encode(address member, bytes32 envelopeHash, uint32 envelopeSize, uint64 epochAfter))`. */
+/**
+ * REMOVE: `keccak256(abi.encode(address member, bytes32 envelopeHash, uint32 envelopeSize, uint64 epochAfter))`.
+ *
+ * @param p.member `qor1...` or exact EIP-55 `0x...`; all-lowercase `0x` is refused (threat model C16).
+ * @throws AddressError for a member in any other form. ActionError for the zero member, a zero or
+ *   malformed envelopeHash, an envelopeSize outside 1 to MAX_ENVELOPE_SIZE, or an epochAfter
+ *   outside uint64.
+ */
 export function paramsRemove(p: { member: string; envelopeHash: Bytes32; envelopeSize: Uint; epochAfter: Uint }): Hex {
   return keccak256(
     encodeAbiParameters(
       [{ type: "address" }, { type: "bytes32" }, { type: "uint32" }, { type: "uint64" }],
-      [account(p.member, "member"), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize), uint(p.epochAfter, 64, "epochAfter")],
+      [person(p.member, "member"), bytes32(p.envelopeHash, "envelopeHash"), envelopeSize(p.envelopeSize), uint(p.epochAfter, 64, "epochAfter")],
     ),
   );
 }
@@ -106,10 +132,27 @@ export function paramsPost(p: { docRef: Bytes32; cipherHash: Bytes32; cipherSize
   );
 }
 
-/** TRANSFER: `keccak256(abi.encode(address newChair))`. */
+/**
+ * TRANSFER: `keccak256(abi.encode(address newChair))`.
+ *
+ * @param p.newChair `qor1...` or exact EIP-55 `0x...`; all-lowercase `0x` is refused (threat model C16).
+ * @throws AddressError for a newChair in any other form. ActionError for the zero address.
+ */
 export function paramsTransfer(p: { newChair: string }): Hex {
-  return keccak256(encodeAbiParameters([{ type: "address" }], [account(p.newChair, "newChair")]));
+  return keccak256(encodeAbiParameters([{ type: "address" }], [person(p.newChair, "newChair")]));
 }
+
+/**
+ * The typed fields of one board action, keyed by its action code. signBoardAction turns these into
+ * the paramsHash and the message itself, so application code never hands over bytes to sign.
+ */
+export type BoardActionInput =
+  | ({ action: typeof Action.CREATE } & Parameters<typeof paramsCreate>[0])
+  | ({ action: typeof Action.ADD } & Parameters<typeof paramsAdd>[0])
+  | ({ action: typeof Action.REMOVE } & Parameters<typeof paramsRemove>[0])
+  | ({ action: typeof Action.ROTATE } & Parameters<typeof paramsRotate>[0])
+  | ({ action: typeof Action.POST } & Parameters<typeof paramsPost>[0])
+  | ({ action: typeof Action.TRANSFER } & Parameters<typeof paramsTransfer>[0]);
 
 /**
  * The exact 256 bytes a chair signs for one board action (docs/spec/actions.md, threat model C2, C4):

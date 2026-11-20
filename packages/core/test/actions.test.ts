@@ -14,6 +14,7 @@ import {
   paramsRotate,
   paramsTransfer,
 } from "../src/actions.ts";
+import { AddressError, toQor1 } from "../src/address.ts";
 import { Action, BOARD_TAG, CHALLENGE_TAG, MAX_DEADLINE_AHEAD, Mode } from "../src/constants.ts";
 
 // abi.encode of static types is a run of 32-byte big-endian words. Built by hand here, apart from viem.
@@ -89,8 +90,27 @@ describe("params hashes", () => {
     const a = paramsAdd({ member: MEMBER, mode: Mode.SEAL_CURRENT, envelopeHash: ENVELOPE_HASH, envelopeSize: 1729, epochAfter: 4n });
     const b = paramsAdd({ member: MEMBER, mode: Mode.SEAL_CURRENT, envelopeHash: hexToBytes(ENVELOPE_HASH), envelopeSize: 1729n, epochAfter: 4 });
     const c = paramsAdd({ member: MEMBER, mode: Mode.SEAL_CURRENT, envelopeHash: ENVELOPE_HASH.toUpperCase().replace("0X", "0x") as Hex, envelopeSize: 1729, epochAfter: 4n });
+    const d = paramsAdd({ member: toQor1(hexToBytes(MEMBER)), mode: Mode.SEAL_CURRENT, envelopeHash: ENVELOPE_HASH, envelopeSize: 1729, epochAfter: 4n });
     expect(b).toBe(a);
     expect(c).toBe(a);
+    expect(d).toBe(a);
+  });
+
+  it("decode chair, member and newChair strictly: all-lowercase 0x is refused, EIP-55 and qor1 give one hash (C16)", () => {
+    const eip55 = "0x8A37d6f2DA1F8a07f1735c568C2611205d93e973";
+    const qor1 = toQor1(hexToBytes(eip55));
+    const lower = eip55.toLowerCase();
+    const builders = [
+      (who: string) => paramsCreate({ chair: who, boardRef: BOARD_REF, envelopeHash: ENVELOPE_HASH, envelopeSize: 1729 }),
+      (who: string) => paramsAdd({ member: who, mode: Mode.SEAL_CURRENT, envelopeHash: ENVELOPE_HASH, envelopeSize: 1729, epochAfter: 4n }),
+      (who: string) => paramsRemove({ member: who, envelopeHash: ENVELOPE_HASH, envelopeSize: 1729, epochAfter: 5n }),
+      (who: string) => paramsTransfer({ newChair: who }),
+    ];
+    for (const build of builders) {
+      expect(() => build(lower)).toThrow(AddressError);
+      expect(build(qor1)).toBe(build(eip55));
+    }
+    expect(actionMessage({ ...base, registry: lower })).toHaveLength(256);
   });
 
   it("change when any single parameter changes", () => {

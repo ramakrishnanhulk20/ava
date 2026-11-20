@@ -50,9 +50,11 @@ afterEach(() => {
 });
 
 describe("fetchKemKey", () => {
-  it("returns the key when the answer is for this account, algorithm 2, 1,568 valid bytes", async () => {
+  it("returns the account and its key as one frozen pair when the answer is for this account, algorithm 2, 1,568 valid bytes", async () => {
     const calls = stub(() => json(answer(found())));
-    expect(await fetchKemKey(REQUESTED)).toEqual(KEY);
+    const recipient = await fetchKemKey(REQUESTED);
+    expect(recipient).toEqual({ address: REQUESTED, kemPublicKey: KEY });
+    expect(Object.isFrozen(recipient)).toBe(true);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe(`${EVM_RPC}/`);
     expect(calls[0]!.init.method).toBe("POST");
@@ -62,7 +64,14 @@ describe("fetchKemKey", () => {
 
   it("accepts the qor1 form of the same account in the answer", async () => {
     stub(() => json(answer(found({ address: toQor1(hexToBytes(REQUESTED)) }))));
-    expect(await fetchKemKey(REQUESTED.toLowerCase())).toEqual(KEY);
+    expect(await fetchKemKey(REQUESTED.toLowerCase())).toEqual({ address: REQUESTED, kemPublicKey: KEY });
+  });
+
+  it("pairs the key with the EIP-55 form of the account asked for, whatever form it was asked in (C15, C16)", async () => {
+    for (const asked of [REQUESTED.toLowerCase(), toQor1(hexToBytes(REQUESTED))]) {
+      stub(() => json(answer(found())));
+      expect((await fetchKemKey(asked)).address).toBe(REQUESTED);
+    }
   });
 
   it("refuses an answer whose address differs from the request", async () => {
@@ -120,10 +129,16 @@ describe("fetchKemKey", () => {
     expect(await failure(fetchKemKey(REQUESTED, { timeoutMs: 50 }))).toBe("TIMEOUT");
   });
 
-  it("refuses a bad address and a non-https endpoint before any request", async () => {
+  it("refuses a bad address before any request", async () => {
     const calls = stub(() => json(answer(found())));
     await expect(fetchKemKey("0x4786dcd1301432DDFaF65e0d089CbDEFA6ccEa24")).rejects.toThrow(AddressError);
-    await expect(fetchKemKey(REQUESTED, { rpc: "http://evm-testnet.qore.host" })).rejects.toThrow(TypeError);
     expect(calls).toHaveLength(0);
+  });
+
+  it("asks only the chain's public EVM JSON-RPC, whatever endpoint a caller tries to pass (C15)", async () => {
+    const calls = stub(() => json(answer(found())));
+    const elsewhere = { rpc: "https://attacker.example", timeoutMs: 8000 } as { timeoutMs: number };
+    expect(await fetchKemKey(REQUESTED, elsewhere)).toEqual({ address: REQUESTED, kemPublicKey: KEY });
+    expect(calls.map((c) => new URL(c.url).origin)).toEqual([new URL(EVM_RPC).origin]);
   });
 });

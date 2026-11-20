@@ -30,9 +30,10 @@ export {
   paramsRemove,
   paramsRotate,
   paramsTransfer,
+  type BoardActionInput,
 } from "./actions.ts";
-export { generateMnemonic, identityFromMnemonic, type Identity } from "./identity.ts";
-export { signAction, verifyAction } from "./sign.ts";
+export { canonicalPhrase, generateMnemonic, identityFromMnemonic, type Identity } from "./identity.ts";
+export { signAction, signBoardAction, signChallenge, verifyAction } from "./sign.ts";
 export { HashMismatch, assertHash, sameHash, sha256 } from "./hash.ts";
 export {
   DocumentError,
@@ -47,6 +48,7 @@ export {
   placeOf,
   purposeFor,
   sealEpochKey,
-  type SealRecipientAccount,
+  type FreshEpochKey,
+  type OpenedEpochKey,
 } from "./seal.ts";
-export { KemKeyUnavailable, fetchKemKey, type KemKeyFailure } from "./kem.ts";
+export { KemKeyUnavailable, fetchKemKey, type KemKeyFailure, type KemRecipient } from "./kem.ts";

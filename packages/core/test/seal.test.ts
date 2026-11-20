@@ -19,7 +19,10 @@ import {
   placeOf,
   purposeFor,
   sealEpochKey,
+  type FreshEpochKey,
+  type OpenedEpochKey,
 } from "../src/seal.ts";
+import { fetchKemKey, type KemRecipient } from "../src/kem.ts";
 
 const REGISTRY = "0x00000000000000000000000000000000000a0a0a";
 const OTHER_REGISTRY = "0x00000000000000000000000000000000000b0b0b";
@@ -41,6 +44,7 @@ beforeAll(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 function qoreSealCode(fn: () => unknown): string {
@@ -63,16 +67,28 @@ function trap<T extends object>(target: T): { value: T; touched: () => boolean }
   return { value, touched: () => touched };
 }
 
-function sealTwo(epochKey: Uint8Array, epoch = 4n, ref: Uint8Array = boardRef): Uint8Array {
+/** A recipient built by hand, standing in for the pair fetchKemKey would return for that address. */
+const recipient = (address: string, kemPublicKey: Uint8Array): KemRecipient => ({ address, kemPublicKey }) as KemRecipient;
+
+/** The chain answering qor_getKEMKey with the key each account published. */
+function chainPublishes(keys: Map<string, Uint8Array>): void {
+  vi.stubGlobal("fetch", async (_url: URL | string, init: RequestInit) => {
+    const [account] = JSON.parse(String(init.body)).params as [string];
+    const result = { address: account.toLowerCase(), found: true, algorithm_id: 2, public_key: bytesToHex(keys.get(account)!) };
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+  });
+}
+
+/** A key standing in for one openEpochKey returned, for tests of the document layer on its own. */
+const openedKey = (): OpenedEpochKey => newEpochKey() as Uint8Array as OpenedEpochKey;
+
+function sealTwo(epochKey: FreshEpochKey, epoch = 4n, ref: Uint8Array = boardRef): Uint8Array {
   return sealEpochKey({
     registry: REGISTRY,
     boardRef: ref,
     epoch,
     epochKey,
-    recipients: [
-      { address: ALICE, kemPublicKey: alice.mlkemPublicKey },
-      { address: BOB, kemPublicKey: bob.mlkemPublicKey },
-    ],
+    recipients: [recipient(ALICE, alice.mlkemPublicKey), recipient(BOB, bob.mlkemPublicKey)],
   });
 }
 
@@ -112,7 +128,7 @@ describe("place and purpose", () => {
     expect(() => purposeFor(REGISTRY, ZERO_REF, 0n)).toThrow(EnvelopeError);
     expect(() => sealTwo(newEpochKey(), 0n, hexToBytes(ZERO_REF))).toThrow(EnvelopeError);
     const plaintext = new Uint8Array(10);
-    await expect(encryptDocument({ epochKey: newEpochKey(), registry: REGISTRY, boardRef: ZERO_REF, epoch: 0n, docRef: newDocRef(), plaintext })).rejects.toThrow(DocumentError);
+    await expect(encryptDocument({ epochKey: openedKey(), registry: REGISTRY, boardRef: ZERO_REF, epoch: 0n, docRef: newDocRef(), plaintext })).rejects.toThrow(DocumentError);
   });
 });
 
@@ -185,17 +201,46 @@ describe("sealEpochKey and openEpochKey", () => {
   });
 
   it("refuses a short key, no recipients, too many, a repeated account and a bad KEM key", () => {
-    const one = [{ address: ALICE, kemPublicKey: alice.mlkemPublicKey }];
+    const one = [recipient(ALICE, alice.mlkemPublicKey)];
     const args = { registry: REGISTRY, boardRef, epoch: 4n };
-    expect(() => sealEpochKey({ ...args, epochKey: new Uint8Array(31), recipients: one })).toThrow(EnvelopeError);
+    expect(() => sealEpochKey({ ...args, epochKey: new Uint8Array(31) as FreshEpochKey, recipients: one })).toThrow(EnvelopeError);
     expect(() => sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: [] })).toThrow(EnvelopeError);
     expect(() => sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: Array(MAX_MEMBERS + 1).fill(one[0]) })).toThrow(EnvelopeError);
     expect(() =>
-      sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: [one[0]!, { address: ALICE.toLowerCase(), kemPublicKey: bob.mlkemPublicKey }] }),
+      sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: [one[0]!, recipient(ALICE.toLowerCase(), bob.mlkemPublicKey)] }),
     ).toThrow(EnvelopeError);
-    expect(qoreSealCode(() => sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: [{ address: ALICE, kemPublicKey: new Uint8Array(1568).fill(0xff) }] }))).toBe(
+    expect(qoreSealCode(() => sealEpochKey({ ...args, epochKey: newEpochKey(), recipients: [recipient(ALICE, new Uint8Array(1568).fill(0xff))] }))).toBe(
       "INVALID_KEY",
     );
+  });
+
+  it("refuses two accounts that carry the same ML-KEM key (C15)", () => {
+    const args = { registry: REGISTRY, boardRef, epoch: 4n, epochKey: newEpochKey() };
+    const shared = [
+      recipient(ALICE, alice.mlkemPublicKey),
+      recipient(BOB, Uint8Array.from(alice.mlkemPublicKey)),
+    ];
+    expect(() => sealEpochKey({ ...args, recipients: shared })).toThrow(EnvelopeError);
+  });
+
+  it("takes pairs only as fetchKemKey made them: Alice's fetched key under Bob's address does not compile (C15)", async () => {
+    chainPublishes(
+      new Map([
+        [ALICE, alice.mlkemPublicKey],
+        [BOB, bob.mlkemPublicKey],
+      ]),
+    );
+    const fromAlice = await fetchKemKey(ALICE);
+    const fromBob = await fetchKemKey(BOB);
+    const args = { registry: REGISTRY, boardRef, epoch: 4n, epochKey: newEpochKey() };
+    expect(parseEnvelope(sealEpochKey({ ...args, recipients: [fromAlice, fromBob] })).entries).toHaveLength(2);
+    expect(() =>
+      sealEpochKey({
+        ...args,
+        // @ts-expect-error The brand is on the pair, so a key fetched for Alice cannot be relabelled with Bob's address.
+        recipients: [fromAlice, { address: fromBob.address, kemPublicKey: fromAlice.kemPublicKey }],
+      }),
+    ).toThrow(EnvelopeError);
   });
 });
 
@@ -204,7 +249,7 @@ describe("documents", () => {
   const where = () => ({ registry: REGISTRY, boardRef, epoch: 4n });
 
   it("encrypt then decrypt", async () => {
-    const epochKey = newEpochKey();
+    const epochKey = openedKey();
     const docRef = newDocRef();
     const ciphertext = await encryptDocument({ ...where(), epochKey, docRef, plaintext });
     expect(ciphertext).toHaveLength(12 + plaintext.length + 16);
@@ -212,7 +257,7 @@ describe("documents", () => {
   });
 
   it("follows the spec layout: HKDF salt docRef, info ava-doc-v1 || place || epoch, AAD place || epoch || docRef", async () => {
-    const epochKey = newEpochKey();
+    const epochKey = openedKey();
     const docRef = newDocRef();
     const ciphertext = await encryptDocument({ ...where(), epochKey, docRef, plaintext });
     const subtle = globalThis.crypto.subtle;
@@ -229,7 +274,7 @@ describe("documents", () => {
   });
 
   it("decrypt with a moved docRef, epoch, board or registry fails (C13)", async () => {
-    const epochKey = newEpochKey();
+    const epochKey = openedKey();
     const docRef = newDocRef();
     const ciphertext = await encryptDocument({ ...where(), epochKey, docRef, plaintext });
     for (const moved of [
@@ -244,7 +289,7 @@ describe("documents", () => {
   });
 
   it("a document moved between two boards the same chair created fails to decrypt", async () => {
-    const epochKey = newEpochKey();
+    const epochKey = openedKey();
     const docRef = newDocRef();
     const first = newBoardRef();
     const second = newBoardRef();
@@ -255,7 +300,7 @@ describe("documents", () => {
   });
 
   it("two encryptions of the same plaintext give different ciphertexts (C14)", async () => {
-    const epochKey = newEpochKey();
+    const epochKey = openedKey();
     const docRef = newDocRef();
     const a = await encryptDocument({ ...where(), epochKey, docRef, plaintext });
     const b = await encryptDocument({ ...where(), epochKey, docRef, plaintext });
@@ -264,7 +309,7 @@ describe("documents", () => {
   });
 
   it("one changed byte or a wrong size is refused before any key is used (C12)", async () => {
-    const realKey = newEpochKey();
+    const realKey = openedKey();
     const docRef = newDocRef();
     const ciphertext = await encryptDocument({ ...where(), epochKey: realKey, docRef, plaintext });
     const changed = Uint8Array.from(ciphertext);
@@ -285,7 +330,7 @@ describe("documents", () => {
   });
 
   it("refuses a zero docRef", async () => {
-    await expect(encryptDocument({ ...where(), epochKey: newEpochKey(), docRef: new Uint8Array(32), plaintext })).rejects.toThrow(DocumentError);
+    await expect(encryptDocument({ ...where(), epochKey: openedKey(), docRef: new Uint8Array(32), plaintext })).rejects.toThrow(DocumentError);
   });
 });
 

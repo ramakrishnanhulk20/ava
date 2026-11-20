@@ -3,6 +3,7 @@ import { bytesToBigInt, bytesToHex, concatBytes, numberToBytes, stringToBytes } 
 import { accountBytes } from "./address.ts";
 import { CHAIN_ID, MAX_CIPHER_SIZE, MAX_ENVELOPE_SIZE, MAX_MEMBERS } from "./constants.ts";
 import { assertHash, sha256 } from "./hash.ts";
+import type { KemRecipient } from "./kem.ts";
 import { toBytes32, toUint, type Bytes32, type Uint } from "./values.ts";
 
 const KEY_LENGTH = 32;
@@ -28,11 +29,17 @@ export class DocumentError extends Error {
   }
 }
 
-/** One person an epoch key is sealed to: their account and the ML-KEM-1024 key the chain holds for it. */
-export interface SealRecipientAccount {
-  address: string;
-  kemPublicKey: Uint8Array;
-}
+/**
+ * An epoch key openEpochKey took out of an envelope whose size and SHA-256 matched the chain's
+ * record (threat model C12). The brand is a type only: at run time it is plain bytes.
+ */
+export type OpenedEpochKey = Uint8Array & { readonly __ava: "opened-epoch-key" };
+
+/**
+ * A new epoch key from newEpochKey (C11). It may be sealed, but no document is encrypted under it
+ * until its envelope is on chain and opened back as an OpenedEpochKey. A type only, like the above.
+ */
+export type FreshEpochKey = Uint8Array & { readonly __ava: "fresh-epoch-key" };
 
 type Refusal = typeof EnvelopeError | typeof DocumentError;
 
@@ -74,9 +81,12 @@ function placeEpoch(registry: string, boardRef: Bytes32, epoch: Uint, Err: Refus
 /**
  * A new epoch key: 32 bytes from the platform's cryptographic random source (threat model C11).
  * Call once per epoch; never derive one key from another or reuse one across boards.
+ *
+ * @returns A FreshEpochKey: sealEpochKey takes it, encryptDocument does not (C12).
+ * @throws Error when the random source returns only zero bytes.
  */
-export function newEpochKey(): Uint8Array {
-  return freshRandom(KEY_LENGTH);
+export function newEpochKey(): FreshEpochKey {
+  return freshRandom(KEY_LENGTH) as FreshEpochKey;
 }
 
 /** A new random 32-byte document reference, picked before a document is encrypted (C13, C14). */
@@ -120,14 +130,28 @@ export function purposeFor(registry: string, boardRef: Bytes32, epoch: Uint): st
  * Seals an epoch key to every recipient (threat model C13): QoreSeal mode `mlkem`, never anonymous,
  * chain id `qorechain-diana`, purpose from {@link purposeFor}, payload `0x01 || epoch (8 bytes) || key`.
  *
- * Each `kemPublicKey` must come from fetchKemKey for that same address (C15).
+ * Each recipient is a KemRecipient exactly as fetchKemKey returned it: the address and its key come
+ * from one chain answer, and a pair built by hand does not compile here without a cast (C15). The
+ * epoch key is a FreshEpochKey for a new epoch, or an OpenedEpochKey when resealing the current one
+ * to a new member (C12).
+ *
+ * Covers the same account listed twice, two accounts carrying byte-equal ML-KEM keys, and, at
+ * compile time, a fetched key relabelled with another address. Does not cover a pair cast to
+ * KemRecipient by the caller, or a genuine account that belongs to the wrong person.
  *
  * @returns The binary envelope: the exact bytes to upload, hash and record.
  * @throws EnvelopeError for a key that is not 32 bytes, no recipients, more than MAX_MEMBERS, the
- *   same account twice, a zero boardRef, or an envelope over MAX_ENVELOPE_SIZE. AddressError for a
- *   bad address. QoreSealError `INVALID_KEY` for a KEM key that fails validateMlkemPublicKey.
+ *   same account twice, the same ML-KEM key under two accounts, a zero boardRef, or an envelope
+ *   over MAX_ENVELOPE_SIZE. AddressError for a bad address. QoreSealError `INVALID_KEY` for a KEM
+ *   key that fails validateMlkemPublicKey.
  */
-export function sealEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Uint; epochKey: Uint8Array; recipients: SealRecipientAccount[] }): Uint8Array {
+export function sealEpochKey(p: {
+  registry: string;
+  boardRef: Bytes32;
+  epoch: Uint;
+  epochKey: OpenedEpochKey | FreshEpochKey;
+  recipients: KemRecipient[];
+}): Uint8Array {
   const purpose = purposeFor(p.registry, p.boardRef, p.epoch);
   const epoch = epochOf(p.epoch, EnvelopeError);
   if (!(p.epochKey instanceof Uint8Array) || p.epochKey.length !== KEY_LENGTH) throw new EnvelopeError("An epoch key is 32 bytes.");
@@ -135,11 +159,16 @@ export function sealEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Ui
     throw new EnvelopeError(`An epoch key is sealed to 1 to ${MAX_MEMBERS} members.`);
   }
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   const recipients = p.recipients.map((r) => {
     const id = bytesToHex(accountBytes(r.address));
     if (seen.has(id)) throw new EnvelopeError("The same account is listed twice.");
     seen.add(id);
     validateMlkemPublicKey(r.kemPublicKey);
+    // One key under two accounts means one of them is not the key that account registered.
+    const key = bytesToHex(r.kemPublicKey);
+    if (seenKeys.has(key)) throw new EnvelopeError("Two accounts carry the same ML-KEM key.");
+    seenKeys.add(key);
     return { mlkemPublicKey: r.kemPublicKey };
   });
   const plaintext = concatBytes([Uint8Array.of(PAYLOAD_VERSION), numberToBytes(epoch, { size: 8 }), p.epochKey]);
@@ -155,6 +184,7 @@ export function sealEpochKey(p: { registry: string; boardRef: Bytes32; epoch: Ui
  * exactly `expectedSize` bytes, then its SHA-256 equals `expectedHash`. Both values are the ones the
  * registry recorded for this board and epoch.
  *
+ * @returns An OpenedEpochKey, the only key type encryptDocument accepts.
  * @throws EnvelopeError for a size that differs from `expectedSize` or is over MAX_ENVELOPE_SIZE, or a
  *   payload whose version or epoch is not the one expected. HashMismatch when the bytes are not the
  *   recorded ones. QoreSealError `NOT_A_RECIPIENT` when the keys hold no entry, `DECRYPTION_FAILED`
@@ -168,7 +198,7 @@ export function openEpochKey(p: {
   expectedHash: Bytes32;
   expectedSize: Uint;
   sealKeys: SealKeyPair;
-}): Uint8Array {
+}): OpenedEpochKey {
   const size = toUint(p.expectedSize, 32);
   if (size === undefined || size === 0n || size > BigInt(MAX_ENVELOPE_SIZE)) throw new EnvelopeError(`An envelope is 1 to ${MAX_ENVELOPE_SIZE} bytes.`);
   if (!(p.envelope instanceof Uint8Array) || BigInt(p.envelope.length) !== size) throw new EnvelopeError("The envelope is not the size the registry recorded.");
@@ -179,7 +209,7 @@ export function openEpochKey(p: {
   const payload = open({ chainId: CHAIN_ID, purpose, envelope: p.envelope, keys: p.sealKeys });
   if (payload.length !== PAYLOAD_LENGTH || payload[0] !== PAYLOAD_VERSION) throw new EnvelopeError("The envelope does not carry a version 1 epoch key.");
   if (bytesToBigInt(payload.subarray(1, 9)) !== epoch) throw new EnvelopeError("The envelope carries the key of another epoch.");
-  return payload.slice(9);
+  return payload.slice(9) as OpenedEpochKey;
 }
 
 /**
@@ -219,10 +249,14 @@ interface DocumentPlace {
  * Encrypts a document for one board and epoch: a fresh random 12-byte nonce, then the AES-256-GCM
  * ciphertext and its 16-byte tag, under the document's own key and the fixed AAD (C13, C14).
  *
+ * Takes only an OpenedEpochKey, so a document is encrypted only under a key opened from an envelope
+ * that matched the chain (C12). A fresh key does not compile here: until its envelope is on chain
+ * and opened back, nothing proves the board's members, and only they, hold it.
+ *
  * @returns `nonce || ciphertext || tag`: the exact bytes to upload, hash and record.
  * @throws DocumentError when the result would be over MAX_CIPHER_SIZE, or for a bad key, boardRef or docRef.
  */
-export async function encryptDocument(p: DocumentPlace & { plaintext: Uint8Array }): Promise<Uint8Array> {
+export async function encryptDocument(p: DocumentPlace & { epochKey: OpenedEpochKey; plaintext: Uint8Array }): Promise<Uint8Array> {
   if (!(p.plaintext instanceof Uint8Array) || NONCE_LENGTH + p.plaintext.length + TAG_LENGTH > MAX_CIPHER_SIZE) {
     throw new DocumentError(`An encrypted document is at most ${MAX_CIPHER_SIZE} bytes.`);
   }

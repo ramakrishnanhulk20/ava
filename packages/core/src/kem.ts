@@ -11,6 +11,20 @@ const MAX_RESPONSE_BYTES = 16_384;
 /** Why no key came back. Every one of them stops the seal. */
 export type KemKeyFailure = "NOT_FOUND" | "WRONG_ACCOUNT" | "WRONG_ALGORITHM" | "INVALID_KEY" | "MALFORMED" | "TIMEOUT" | "NETWORK";
 
+/**
+ * One person an epoch key is sealed to: an account and the ML-KEM-1024 key the chain published for
+ * it, both from one answer (threat model C15). The brand sits on the whole pair and only fetchKemKey
+ * makes one, so a key typed in, read from a request, or fetched for Alice and relabelled as Bob does
+ * not compile as a recipient without a cast. Branding only the key bytes would still let a genuine
+ * key travel under someone else's address. The brand is a type only: at run time the pair is a
+ * frozen plain object.
+ */
+export type KemRecipient = {
+  /** The EIP-55 form of the account fetchKemKey was asked for. */
+  readonly address: Hex;
+  readonly kemPublicKey: Uint8Array;
+} & { readonly __ava: "kem-recipient" };
+
 /** No usable ML-KEM key for the address. Sealing to it must stop (threat model C15). */
 export class KemKeyUnavailable extends Error {
   readonly reason: KemKeyFailure;
@@ -81,27 +95,32 @@ function keyFrom(result: Json, requested: Uint8Array): Uint8Array {
  * Reads the ML-KEM-1024 key an account has published, straight from the chain's public EVM
  * JSON-RPC with `qor_getKEMKey`, never through a server we run (threat model C15, C16).
  *
- * Returns the key only when the answer names exactly the requested 20-byte account (decoded by
+ * Returns a recipient only when the answer names exactly the requested 20-byte account (decoded by
  * the shared address codec), carries algorithm id 2, holds 1,568 bytes and passes QoreSeal's
  * validateMlkemPublicKey. There is no fallback to any other route. Redirects are refused, the
  * answer is capped at 16 KB, and one timeout covers the request and the body.
  *
- * Covers a key served for another account, a wrong or malformed key, and a slow or broken
- * endpoint. Does not cover a genuine key that belongs to the wrong person (the address itself
- * must come from the right person).
+ * Covers a key served for another account, a wrong or malformed key, a slow or broken endpoint,
+ * and a caller pairing a fetched key with another address (the pair is built here, from the bytes
+ * asked for). Does not cover a genuine key that belongs to the wrong person (the address itself
+ * must come from the right person), or a caller who casts a hand-built pair to KemRecipient.
+ *
+ * The endpoint is EVM_RPC and nothing else. There is no option to point the lookup elsewhere, so
+ * no caller or request value can route it to a server that answers with its own keys.
  *
  * @param address The account in any form accountBytes accepts.
- * @param opts.rpc An https JSON-RPC endpoint. Defaults to EVM_RPC.
  * @param opts.timeoutMs Defaults to 8,000.
+ * @returns A frozen KemRecipient: `address` is the EIP-55 form of the account asked for, whatever
+ *   form was passed, and `kemPublicKey` is the 1,568-byte key the chain published for it. This is
+ *   the only source of that type.
  * @throws KemKeyUnavailable for found false, any mismatch, a timeout, a network failure or a
- *   malformed answer. AddressError for a bad address. TypeError for a bad rpc or timeout.
+ *   malformed answer. AddressError for a bad address. TypeError for a bad timeout.
  */
-export async function fetchKemKey(address: string, opts: { rpc?: string; timeoutMs?: number } = {}): Promise<Uint8Array> {
+export async function fetchKemKey(address: string, opts: { timeoutMs?: number } = {}): Promise<KemRecipient> {
   const requested = accountBytes(address);
   const timeoutMs = opts.timeoutMs ?? 8000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new TypeError("timeoutMs must be a positive whole number of milliseconds.");
-  const url = new URL(opts.rpc ?? EVM_RPC);
-  if (url.protocol !== "https:") throw new TypeError("The KEM lookup only goes to an https endpoint.");
+  const url = new URL(EVM_RPC);
 
   const signal = AbortSignal.timeout(timeoutMs);
   let text: string;
@@ -130,5 +149,6 @@ export async function fetchKemKey(address: string, opts: { rpc?: string; timeout
   if (!isObject(body) || body.jsonrpc !== "2.0" || body.id !== REQUEST_ID || body.error !== undefined || !isObject(body.result)) {
     throw new KemKeyUnavailable("MALFORMED", "The KEM lookup answer is not a JSON-RPC result for this request.");
   }
-  return keyFrom(body.result, requested);
+  const kemPublicKey = keyFrom(body.result, requested);
+  return Object.freeze({ address: toHex(requested), kemPublicKey }) as KemRecipient;
 }
