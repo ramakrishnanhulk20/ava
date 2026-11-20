@@ -7,7 +7,7 @@ import { SourceIps } from "./dev.ts";
 import type { SuiteEnv } from "./env.ts";
 import { ROLES, personAt, type Person, type Role } from "./identities.ts";
 import { People } from "./people.ts";
-import { Action, DEADLINE_SECONDS, LocalBlobs, boardAt, calldata, createNonceOf, sealTo, sign } from "./registry.ts";
+import { Action, DEADLINE_SECONDS, LocalBlobs, boardAt, calldata, createNonceOf, sealTo, sign, type EpochKey } from "./registry.ts";
 
 /** The wallet never goes below this, so it can always close its window at the end. */
 export const WALLET_FLOOR_UQOR = 300_000n;
@@ -31,7 +31,7 @@ export interface TestBoards {
   /** Dana's landed MODE_ROTATE addMember on A, signed at A's nonce 0, epoch 0 to 1. */
   addDana: { hash: Hex; args: AddArgs };
   /** Every epoch key this run made, by `${boardId}:${epoch}`. */
-  keys: Map<string, Uint8Array>;
+  keys: Map<string, EpochKey>;
 }
 
 /** What one attack hands a later one. */
@@ -53,8 +53,6 @@ export interface SuiteState {
   demoGuest?: { person: Person; challenge: Challenge };
   /** The join that admitted the demo guest in C43, kept for its replay. */
   join?: { body: string; txHash: Hex };
-  /** C41's fill: the guests this run admitted to fill the demo board, oldest first. */
-  filled?: { guests: Person[] };
 }
 
 export class Ctx {
@@ -122,7 +120,7 @@ export class Ctx {
   }
 
   /** A new board chaired by the wallet, its epoch 0 key sealed to the wallet alone and kept in `keys`. */
-  async createBoard(label: string, keys: Map<string, Uint8Array> = new Map()): Promise<{ id: bigint; hash: Hex }> {
+  async createBoard(label: string, keys: Map<string, EpochKey> = new Map()): Promise<{ id: bigint; hash: Hex }> {
     const w = this.wallet;
     const boardRef = bytesToHex(newBoardRef());
     const epochKey = newEpochKey();
@@ -144,7 +142,7 @@ export class Ctx {
     const w = this.wallet;
     const dana = await this.need("dana");
     const eli = await this.need("eli");
-    const keys = new Map<string, Uint8Array>();
+    const keys = new Map<string, EpochKey>();
     const a = await this.createBoard("A", keys);
     const b = await this.createBoard("B", keys);
 

@@ -34,15 +34,6 @@ import { Action, ZERO_SIGNATURE, abi, boardAt, calldata, createNonceOf, flipByte
 const ONE_UQOR_WEI = 10n ** 12n;
 const ENVELOPE_CAP = 110_000;
 const CIPHER_CAP = 26_214_400n;
-const RESERVED_PREFIXES = [
-  "qorechain-pqc-hybrid-v2",
-  "qorechain-pqc-pop-v1|",
-  "qorechain-pqc-rotate-v1|",
-  "qorechain:pqc:recovery:v1",
-  "qorechain-siwq-v1|",
-  "qorechain-msg-v1|",
-  "qorechain-svm-auth-v2",
-];
 
 const shown = (names: readonly string[]): string => names.map((n) => (n === "" ? "a revert with no data" : n)).join(" or ");
 
@@ -96,25 +87,20 @@ async function memberOf(ctx: Ctx, board: bigint): Promise<Hex> {
 
 const c3: Attack = {
   id: "C3-tag",
-  claim: "No app signature can be anything else: the deployed registry builds every message under a tag whose first byte is 0x20, never 'q', and the shared signer refuses bytes that start with any QoreChain reserved prefix.",
+  claim: "The deployed registry frames its messages the way the offline C3-v1-framing proof assumes: DOMAIN_TAG() is @ava/core's BOARD_TAG, and its actionMessage is 256 bytes under that tag, whose first four bytes read as a v1 body length run past the message.",
   costUqor: 0n,
+  costNote: "reads only; which SDK forms the signer refuses is proven offline by C3-v1-framing",
   async run(ctx) {
     const tag = await ctx.client.readContract({ address: REGISTRY, abi, functionName: "DOMAIN_TAG" });
     const deadline = await ctx.deadline();
     const message = await ctx.client.readContract({ address: REGISTRY, abi, functionName: "actionMessage", args: [Action.ADD, 1n, random32(), 5n, deadline] });
-    const probes: Probe[] = [
+    const bytes = hexToBytes(message);
+    const head = bytes.length >= 4 ? new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, false) : 0;
+    return verdict([
       fact(sameHash(tag, BOARD_TAG) && hexToBytes(tag)[0] === 0x20, `DOMAIN_TAG() is ${tag}, equal to @ava/core's BOARD_TAG, first byte 0x${hexToBytes(tag)[0]!.toString(16)}`),
-      fact(message.length === 2 + 512 && message.slice(0, 66).toLowerCase() === tag.toLowerCase(), `actionMessage() on chain is ${(message.length - 2) / 2} bytes and starts with the tag`),
-    ];
-    for (const prefix of RESERVED_PREFIXES) {
-      for (const size of [256, 224]) {
-        const bytes = new Uint8Array(size);
-        bytes.set(new TextEncoder().encode(prefix));
-        const name = await thrown(() => signAction(ctx.wallet.pqc.secretKey, bytes));
-        probes.push(fact(name === "ActionError", `signAction over ${size} bytes starting "${prefix}": ${name ?? "SIGNED"}`));
-      }
-    }
-    return verdict(probes);
+      fact(bytes.length === 256 && message.slice(0, 66).toLowerCase() === tag.toLowerCase(), `actionMessage() on chain is ${bytes.length} bytes and starts with the tag`),
+      fact(head + 8 > bytes.length, `its first four bytes, read as a v1 body length, say ${head.toLocaleString("en-US")} bytes, past its ${bytes.length}`),
+    ]);
   },
 };
 
@@ -160,7 +146,10 @@ const c16: Attack = {
       fact(Buffer.from(accountBytes(dana.qor1)).equals(Buffer.from(accountBytes(dana.evm))), `${dana.qor1} and ${dana.evm} decode to the same 20 bytes`),
       fact(sameBytes(precompile.pubkey, dana.pqc.publicKey) && precompile.possessionProven && precompile.algorithmId === 1, "pqcKeyStatus(0x) returns her 2,592-byte key, algorithm 1, possession proven"),
       fact(isRegisteredPqcKey(rest, dana.pqc.publicKey) === true && rest.possessionProven === true, "REST /qorechain/pqc/v1/account(qor1) holds the same key, possession proven"),
-      fact(sameBytes(kemEvm, dana.seal.mlkemPublicKey) && kemRest.found && sameBytes(kemRest.key?.publicKey, dana.seal.mlkemPublicKey), "qor_getKEMKey(0x) and REST KEM (qor1) return the same 1,568-byte ML-KEM key"),
+      fact(
+        kemEvm !== undefined && sameAccount(kemEvm.address, dana.evm) && sameBytes(kemEvm.kemPublicKey, dana.seal.mlkemPublicKey) && kemRest.found && sameBytes(kemRest.key?.publicKey, dana.seal.mlkemPublicKey),
+        "qor_getKEMKey(0x) and REST KEM (qor1) return the same 1,568-byte ML-KEM key",
+      ),
       fact(strict === "AddressError" && Buffer.from(accountBytes(lower)).equals(Buffer.from(accountBytes(dana.qor1))), `accountBytesStrict("${lower.slice(0, 10)}...") refuses: ${strict ?? "ACCEPTED"}; the lenient chain-side decoder reads it as the same account`),
     ]);
   },
@@ -465,11 +454,12 @@ const c13: Attack = {
     const tb = await ctx.boards();
     const [sa, sb] = await Promise.all([boardAt(ctx.client, tb.a), boardAt(ctx.client, tb.b)]);
     const grant = (await grantsOf(ctx.client, tb.a, 0n))[0];
-    const k0 = tb.keys.get(`${tb.a}:0`);
-    if (grant === undefined || k0 === undefined) throw new Error("Board A's epoch 0 record is missing.");
+    if (grant === undefined) throw new Error("Board A's epoch 0 record is missing.");
     const envelope = ctx.blobs.get(grant.envelopeHash);
     const openAs = (boardRef: Hex, epoch: bigint) =>
       thrown(() => openEpochKey({ registry: REGISTRY, boardRef, epoch, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: ctx.wallet.seal }));
+    // encryptDocument takes only a key opened from the envelope the chain recorded (C12), as the app gets it.
+    const k0 = openEpochKey({ registry: REGISTRY, boardRef: sa.boardRef, epoch: 0n, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: ctx.wallet.seal });
     const plaintext = globalThis.crypto.getRandomValues(new Uint8Array(300));
     const docRef = random32();
     const cipher = await encryptDocument({ epochKey: k0, registry: REGISTRY, boardRef: sa.boardRef, epoch: 0n, docRef, plaintext });

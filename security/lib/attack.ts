@@ -25,6 +25,20 @@ export interface Attack {
   run(ctx: Ctx): Promise<Result>;
 }
 
+/**
+ * An attack that needs no network, no wallet and no server: it works on @ava/core and the pinned
+ * QoreChain SDK alone. `npx tsx run.ts --offline` runs these with every network call refused, and a
+ * live run runs them first, so their rows sit in the same results file.
+ */
+export interface OfflineAttack {
+  id: `C${number}-${string}`;
+  claim: string;
+  run(): Promise<Result>;
+}
+
+/** An offline attack in the shape the live run's loop takes. It costs nothing. */
+export const asAttack = (a: OfflineAttack): Attack => ({ id: a.id, claim: a.claim, costUqor: 0n, run: () => a.run() });
+
 /** The evidence of an attack that did not run starts with this, and the run counts it as not held. */
 export const NOT_RUN = "not run: ";
 

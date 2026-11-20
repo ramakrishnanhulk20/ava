@@ -1,9 +1,7 @@
-import { accountBytes, sameAccount, toHex, toQor1 } from "@ava/core";
+import { accountBytes, canonicalPhrase, sameAccount, toHex, toQor1 } from "@ava/core";
 import { deriveSealKeys, type SealKeyPair } from "@qorechain/qoreseal";
-import { derivePqcCanonical, deriveUnifiedAccount, validateMnemonic, type PqcKeypair, type UnifiedAccount } from "@qorechain/sdk";
+import { derivePqcCanonical, deriveUnifiedAccount, type PqcKeypair, type UnifiedAccount } from "@qorechain/sdk";
 import type { Hex } from "viem";
-
-const WORDS = 24;
 
 /**
  * One account this suite controls: the security wallet (index 0) or a test identity it funds,
@@ -26,14 +24,23 @@ export interface Person {
   seal: SealKeyPair;
 }
 
-/** The phrase with surrounding and repeated whitespace removed: the one form every reader derives from. */
+/**
+ * The one form every reader derives from: @ava/core's canonicalPhrase (C16), so a phrase pasted with
+ * other spaces or full-width letters gives this suite the same keys it gives the app.
+ *
+ * @throws Error when the phrase is not 24 valid words; the message never repeats the phrase.
+ */
 export function normalizePhrase(raw: string): string {
-  return raw.trim().split(/\s+/).join(" ");
+  return canonicalPhrase(raw);
 }
 
 export function isPhrase(raw: string): boolean {
-  const phrase = normalizePhrase(raw);
-  return phrase.split(" ").length === WORDS && validateMnemonic(phrase);
+  try {
+    canonicalPhrase(raw);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -94,6 +101,18 @@ export type Role = keyof typeof ROLES;
 
 /** The sponsor's once-only test: the first of these with no balance and no key is asked for. */
 export const SPONSORED_RANGE = { from: 100, to: 119 } as const;
+/**
+ * C33-no-kem-guest's guests: one fresh index a run, funded by our own sponsor, because the bot
+ * counts failed joins per address per UTC day and an address used before may already have some.
+ */
+export const NOKEM_SPONSORED_RANGE = { from: 120, to: 199 } as const;
+/**
+ * C15-shared-kem-guest's copiers: one fresh index a run, funded by our own sponsor, kept clear of
+ * every other range so a copier is never reused as a guest or a fill identity.
+ */
+export const SHARED_KEM_SPONSORED_RANGE = { from: 3_000, to: 3_099 } as const;
+/** A sponsored guest pays its own ML-DSA-87 registration from what the sponsor sent, and registers no ML-KEM key. */
+export const SPONSORED_NOKEM_PROFILE: Profile = { mldsa: "proven", kem: false, fundUqor: 0n };
 /**
  * Demo guests. The bot admits an address once, ever, so each run takes the next indices here whose
  * address the demo board's events have never named.

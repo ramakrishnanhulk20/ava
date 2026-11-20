@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   if (pqc.registered && !isOurProvenKey(pqc, wallet)) {
     throw new Error("The account has an ML-DSA-87 key that is not this phrase's key with possession proven. Refusing: a second registration is refused after the fee is taken.");
   }
-  if (kem !== undefined && !Buffer.from(kem).equals(Buffer.from(wallet.seal.mlkemPublicKey))) {
+  if (kem !== undefined && !Buffer.from(kem.kemPublicKey).equals(Buffer.from(wallet.seal.mlkemPublicKey))) {
     throw new Error("The account publishes an ML-KEM-1024 key that is not this phrase's. Refusing to replace it.");
   }
   if (pqc.registered && kem !== undefined) {

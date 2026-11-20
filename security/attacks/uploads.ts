@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { MAX_ENVELOPE_SIZE, newEpochKey, sealEpochKey, sha256 } from "@ava/core";
+import { MAX_ENVELOPE_SIZE, newEpochKey, sealEpochKey, sha256, type KemRecipient } from "@ava/core";
 import { DOCUMENT_CAP, DOCUMENT_CONTENT_TYPE, VERIFY_WINDOW_MS } from "../../packages/server/src/docupload.ts";
 import { notRun, verdict, type Attack, type Probe } from "../lib/attack.ts";
 import { readBlob } from "../lib/blobs.ts";
@@ -19,21 +19,27 @@ const MARK_ONLY_AFTER_MS = VERIFY_WINDOW_MS + 120_000;
 const hexOf = (bytes: Uint8Array): string => Buffer.from(sha256(bytes)).toString("hex");
 const sameBytes = (a: Uint8Array | undefined, b: Uint8Array): boolean => a !== undefined && Buffer.from(a).equals(Buffer.from(b));
 
-/** A real QoreSeal envelope, sealed locally to the wallet's own ML-KEM key; it never goes on chain. */
+/**
+ * A real QoreSeal envelope, sealed locally to the wallet's own ML-KEM key; it never goes on chain and
+ * nobody else opens it, so the pair built here from the wallet's derived key stands in for the one
+ * fetchKemKey would return (hence the cast on the pair).
+ */
 function testEnvelope(ctx: Ctx): Uint8Array {
-  return sealEpochKey({ registry: REGISTRY, boardRef: random32(), epoch: 0n, epochKey: newEpochKey(), recipients: [{ address: ctx.wallet.evm, kemPublicKey: ctx.wallet.seal.mlkemPublicKey }] });
+  const recipient = { address: ctx.wallet.evm, kemPublicKey: ctx.wallet.seal.mlkemPublicKey } as KemRecipient;
+  return sealEpochKey({ registry: REGISTRY, boardRef: random32(), epoch: 0n, epochKey: newEpochKey(), recipients: [recipient] });
 }
 
 const upload = (from: string, path: string, body: Uint8Array, extra: { chunked?: boolean; headers?: Record<string, string> } = {}): Promise<DevAnswer> =>
   dev({ method: "POST", path, from, headers: { ...OCTET, ...extra.headers }, body, ...(extra.chunked ? { chunked: true } : {}) });
 
-const token = (from: string, sha: string): Promise<DevAnswer> => dev({ method: "POST", path: "/api/document/token", from, headers: JSON_HEADERS, body: JSON.stringify({ sha256: sha }) });
+/** A token request names the document and declares its size; the token then lets in at most that many bytes. */
+const token = (from: string, sha: string, size: number): Promise<DevAnswer> => dev({ method: "POST", path: "/api/document/token", from, headers: JSON_HEADERS, body: JSON.stringify({ sha256: sha, size }) });
 const verify = (from: string, sha: string): Promise<DevAnswer> => dev({ method: "POST", path: "/api/document/verify", from, headers: JSON_HEADERS, body: JSON.stringify({ sha256: sha }), timeoutMs: 60_000 });
 
-/** A token our handler issued for exactly this hash, or undefined. Every token is recorded with the guard before it is used. */
-function issued(a: DevAnswer, sha: string): string | undefined {
+/** A token our handler issued for exactly this hash and declared size, or undefined. Every token is recorded with the guard before it is used. */
+function issued(a: DevAnswer, sha: string, size: number): string | undefined {
   const j = a.json as { exists?: unknown; pathname?: unknown; token?: unknown; contentType?: unknown; maxBytes?: unknown } | undefined;
-  if (a.status !== 200 || j?.exists !== false || j.pathname !== `document/${sha}` || j.contentType !== DOCUMENT_CONTENT_TYPE || j.maxBytes !== DOCUMENT_CAP || typeof j.token !== "string") return undefined;
+  if (a.status !== 200 || j?.exists !== false || j.pathname !== `document/${sha}` || j.contentType !== DOCUMENT_CONTENT_TYPE || j.maxBytes !== size || typeof j.token !== "string") return undefined;
   noteIssuedToken(j.token);
   return j.token;
 }
@@ -49,6 +55,28 @@ async function put(pathname: string, bytes: Uint8Array, tokenValue: string, cont
     const message = err instanceof Error ? err.message.replace(/\s+/g, " ").slice(0, 160) : String(err);
     return { ok: false, why: `${name}: ${message}` };
   }
+}
+
+/**
+ * A document stored the way a browser stores one before its post: a token our handler issued for
+ * its hash, the upload straight to our own store, then our handler's verify.
+ *
+ * @returns Its name and the size verify answered, or why there is none; `unconfigured` when the
+ *   server says that part of it is not set up.
+ */
+export async function verifiedDocument(ctx: Ctx, bytes: Uint8Array): Promise<{ sha: string; size: number } | { why: string; unconfigured: boolean }> {
+  const from = ctx.ips.fresh();
+  const sha = hexOf(bytes);
+  const t = await token(from, sha, bytes.length);
+  if (notConfigured(t)) return { why: `the token endpoint answers ${said(t)}`, unconfigured: true };
+  const value = issued(t, sha, bytes.length);
+  if (value === undefined) return { why: `the token request for document/${sha.slice(0, 16)}... answered ${said(t)}`, unconfigured: false };
+  const stored = await put(`document/${sha}`, bytes, value, DOCUMENT_CONTENT_TYPE);
+  if (!stored.ok) return { why: `the store refused the token's own upload: ${stored.why}`, unconfigured: false };
+  const v = await verify(from, sha);
+  const j = v.json as { sha256?: unknown; size?: unknown } | undefined;
+  if (v.status !== 200 || j?.sha256 !== sha || j.size !== bytes.length) return { why: `verify of document/${sha.slice(0, 16)}... answered ${said(v)}`, unconfigured: notConfigured(v) };
+  return { sha, size: bytes.length };
 }
 
 /**
@@ -121,16 +149,16 @@ const urlCheck: Attack = {
 
 const tokenPathname: Attack = {
   id: "C28-token-pathname",
-  claim: "A document token allows exactly one pathname: our handler issues it for document/<sha256> only, octet-stream, 25 MiB, and the store refuses the same token for another pathname, which stays empty.",
+  claim: "A document token allows exactly one pathname: our handler issues it for document/<sha256> only, octet-stream, at most the size the request declared, and the store refuses the same token for another pathname, which stays empty.",
   costUqor: 0n,
   async run(ctx) {
     if (ctx.env.blobOrigin === undefined) return notRun("BLOB_ORIGIN is not set in security/.env");
     const from = ctx.ips.fresh();
     const x = randomBytes(4_096);
     const sha = hexOf(x);
-    const t = await token(from, sha);
+    const t = await token(from, sha, x.length);
     if (notConfigured(t)) return notRun(`the token endpoint answers ${said(t)}`);
-    const value = issued(t, sha);
+    const value = issued(t, sha, x.length);
     if (value === undefined) return verdict([{ ok: false, line: `token request -> ${said(t)}, not a token for document/${sha.slice(0, 16)}...` }]);
     ctx.state.docToken = { token: value, x, sha };
     const y = randomBytes(4_096);
@@ -138,7 +166,7 @@ const tokenPathname: Attack = {
     // Nothing was ever stored or read at this name before, so a 404 here is not a cached one.
     const read = await readBlob(new URL(`${ctx.env.blobOrigin}/document/${hexOf(y)}`).href, y.length + 1);
     return verdict([
-      { ok: true, line: `token issued for document/${sha.slice(0, 16)}..., ${DOCUMENT_CONTENT_TYPE}, at most ${DOCUMENT_CAP} bytes` },
+      { ok: true, line: `token issued for document/${sha.slice(0, 16)}..., ${DOCUMENT_CONTENT_TYPE}, at most the ${x.length} bytes declared` },
       { ok: refusedByStore(r), line: putLine("the same token for another pathname", r) },
       { ok: read.status === 404, line: `that other pathname read back: ${read.status}` },
     ]);
@@ -210,21 +238,24 @@ const headers: Attack = {
 
 const tokenSize: Attack = {
   id: "C28-token-size",
-  claim: "A document token allows at most 25 MiB: the store refuses 26,214,401 bytes under the token's own pathname, and verify then finds nothing stored.",
+  claim: "A document token allows at most 25 MiB: a request declaring 26,214,401 bytes is refused 400 bad_size with no token, and under a token declaring 26,214,400 the store refuses 26,214,401 bytes at the token's own pathname, and verify then finds nothing stored.",
   costUqor: 0n,
   costNote: "uploads 25 MiB of random bytes to our own store, which refuses them",
   async run(ctx) {
     const from = ctx.ips.fresh();
     const z = randomBytes(DOCUMENT_CAP + 1);
     const sha = hexOf(z);
-    const t = await token(from, sha);
-    if (notConfigured(t)) return notRun(`the token endpoint answers ${said(t)}`);
-    const value = issued(t, sha);
-    if (value === undefined) return verdict([{ ok: false, line: `token request -> ${said(t)}` }]);
+    const over = await token(from, sha, z.length);
+    if (notConfigured(over)) return notRun(`the token endpoint answers ${said(over)}`);
+    const overCap: Probe = { ok: over.status === 400 && over.error === "bad_size" && (over.json as { token?: unknown } | undefined)?.token === undefined, line: `token request declaring ${z.length} bytes -> ${said(over)}` };
+    const t = await token(from, sha, DOCUMENT_CAP);
+    const value = issued(t, sha, DOCUMENT_CAP);
+    if (value === undefined) return verdict([overCap, { ok: false, line: `token request declaring ${DOCUMENT_CAP} bytes -> ${said(t)}` }]);
     const r = await put(`document/${sha}`, z, value, DOCUMENT_CONTENT_TYPE);
     const v = await verify(from, sha);
     return verdict([
-      { ok: refusedByStore(r), line: putLine(`${z.length} bytes`, r) },
+      overCap,
+      { ok: refusedByStore(r), line: putLine(`${z.length} bytes under a token declaring ${DOCUMENT_CAP}`, r) },
       { ok: v.status === 409 && (v.error === "blob_missing" || v.error === "too_large"), line: `verify of that name -> ${said(v)}` },
     ]);
   },
@@ -239,9 +270,9 @@ const wrongBytes: Attack = {
     const from = ctx.ips.fresh();
     const a = randomBytes(4_096);
     const sha = hexOf(a);
-    const t = await token(from, sha);
+    const t = await token(from, sha, a.length);
     if (notConfigured(t)) return notRun(`the token endpoint answers ${said(t)}`);
-    const value = issued(t, sha);
+    const value = issued(t, sha, a.length);
     if (value === undefined) return verdict([{ ok: false, line: `token request -> ${said(t)}` }]);
     const wrong = randomBytes(4_096);
     const r = await put(`document/${sha}`, wrong, value, DOCUMENT_CONTENT_TYPE);

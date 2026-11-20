@@ -1,4 +1,4 @@
-import { KemKeyUnavailable, fetchKemKey } from "@ava/core";
+import { KemKeyUnavailable, fetchKemKey, type KemRecipient } from "@ava/core";
 import { buildRegisterKemKeyMessage } from "@qorechain/qoreseal";
 import { buildRegisterPqcKeyMsg, isRegisteredPqcKey, msg, qorechainRegistry, signProofOfPossession, verifyProofOfPossession, withRetry, type PqcStatus } from "@qorechain/sdk";
 import { DENOM, KEY_REGISTRATION_FEE } from "../../packages/server/src/config.ts";
@@ -22,8 +22,11 @@ export function isOurProvenKey(pqc: PqcStatus, person: Person): boolean {
   return isOurKey(pqc, person) && pqc.possessionProven === true;
 }
 
-/** The ML-KEM-1024 key qor_getKEMKey returns for the address, or undefined when it has none. Any other failure is thrown. */
-export async function kemOf(address: string): Promise<Uint8Array | undefined> {
+/**
+ * The account and the ML-KEM-1024 key qor_getKEMKey returns for it, as @ava/core's KemRecipient pair
+ * (C15), or undefined when it has none. Any other failure is thrown.
+ */
+export async function kemOf(address: string): Promise<KemRecipient | undefined> {
   try {
     return await withRetry(() => fetchKemKey(address), {
       retries: 4,
@@ -72,10 +75,16 @@ export async function registerMldsa(person: Person, proven: boolean): Promise<Co
   return tx;
 }
 
-function kemMessages(person: Person): Messages {
-  const message = msg.pqc.registerKemKey({ sender: person.qor1, publicKey: person.seal.mlkemPublicKey });
+/**
+ * MsgRegisterKEMKey from `person` for `publicKey`, by default the person's own ML-KEM key.
+ * C15-shared-kem-guest passes another account's published key, to learn whether the chain takes a copy.
+ *
+ * @throws When the SDK and QoreSeal encode the message differently; nothing is sent.
+ */
+export function kemMessages(person: Person, publicKey: Uint8Array = person.seal.mlkemPublicKey): Messages {
+  const message = msg.pqc.registerKemKey({ sender: person.qor1, publicKey });
   // The SDK message is the one its registry can sign; QoreSeal's builder is the reference encoding.
-  const reference = buildRegisterKemKeyMessage({ sender: person.qor1, mlkemPublicKey: person.seal.mlkemPublicKey });
+  const reference = buildRegisterKemKeyMessage({ sender: person.qor1, mlkemPublicKey: publicKey });
   if (message.typeUrl !== reference.typeUrl || !Buffer.from(qorechainRegistry().encode(message)).equals(Buffer.from(reference.value))) {
     throw new Error("The SDK and QoreSeal encode the KEM registration differently. Refusing to send.");
   }
@@ -85,7 +94,7 @@ function kemMessages(person: Person): Messages {
 /** Registers the person's ML-KEM-1024 key with MsgRegisterKEMKey, hybrid-signed, and waits until qor_getKEMKey returns it. */
 export async function registerKem(person: Person): Promise<CommittedTx> {
   const tx = await nativeTx(person, "hybrid", kemMessages(person));
-  await waitFor(`${person.role} ML-KEM-1024 key`, async () => sameBytes(await kemOf(person.evm), person.seal.mlkemPublicKey));
+  await waitFor(`${person.role} ML-KEM-1024 key`, async () => sameBytes((await kemOf(person.evm))?.kemPublicKey, person.seal.mlkemPublicKey));
   return tx;
 }
 
@@ -100,12 +109,13 @@ export async function removeKem(person: Person): Promise<CommittedTx> {
 export interface Standing {
   balance: bigint;
   pqc: PqcStatus;
+  /** The ML-KEM key the chain publishes for the person's own account, or undefined when there is none. */
   kem: Uint8Array | undefined;
 }
 
 export async function standingOf(person: Person): Promise<Standing> {
   const [balance, pqc, kem] = await Promise.all([balanceOf(person.qor1), pqcStatus(person.qor1), kemOf(person.evm)]);
-  return { balance, pqc, kem };
+  return { balance, pqc, kem: kem?.kemPublicKey };
 }
 
 function mldsaDone(s: Standing, person: Person, profile: Profile): boolean {

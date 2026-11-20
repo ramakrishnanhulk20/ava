@@ -66,11 +66,17 @@ export const formatQor = (uqor: bigint): string => {
   return `${sign}${abs / 1_000_000n}${fraction === "" ? "" : `.${fraction}`}`;
 };
 
+/** What the chain's simulation made of one exact signed transaction: the gas it used, or its refusal in the chain's own words. */
+export type Simulation = { ok: true; gasUsed: bigint } | { ok: false; status: number; message: string };
+
 /**
- * Prices a native transaction the way packages/contracts/scripts/tx.ts does: simulated gas times
- * 1.3, at 0.15 uqor per gas, refused under the chain's floor or above the server's native fee cap.
+ * Signs the transaction as `person` at its current sequence and has the chain run it without
+ * broadcasting it, the native lane's eth_call. Nothing is sent either way. A refusal keeps the
+ * chain's own message, whitespace collapsed and cut at 400 characters.
+ *
+ * @throws When the account does not exist on chain yet, or the chain answers success with no gas figure.
  */
-export async function simulatedFee(person: Person, mode: "classical" | "hybrid", messages: Messages): Promise<Fee> {
+export async function simulateNative(person: Person, mode: "classical" | "hybrid", messages: Messages): Promise<Simulation> {
   const auth = await accountSequence(person.qor1);
   if (auth === undefined) throw new Error(`${person.role} (${person.qor1}) does not exist on chain yet: fund it first.`);
   const signer = new EthNativeSigner(person.unified, { signMode: mode, rest: REST });
@@ -82,13 +88,32 @@ export async function simulatedFee(person: Person, mode: "classical" | "hybrid",
     body: JSON.stringify({ tx_bytes: Buffer.from(txRawBytes).toString("base64") }),
     signal: AbortSignal.timeout(20_000),
   });
-  const body = (await response.json().catch(() => ({}))) as { gas_info?: { gas_used?: unknown } };
+  const body = (await response.json().catch(() => ({}))) as { gas_info?: { gas_used?: unknown }; message?: unknown };
+  if (!response.ok) {
+    const said = typeof body.message === "string" ? body.message.replace(/\s+/g, " ").trim().slice(0, 400) : "";
+    return { ok: false, status: response.status, message: said === "" ? "no message" : said };
+  }
   const used = body.gas_info?.gas_used;
-  if (!response.ok || typeof used !== "string" || !/^\d{1,12}$/.test(used)) throw new Error(`Simulation of ${person.role}'s transaction failed (HTTP ${response.status}). Nothing was sent.`);
-  const gas = ceilDiv(BigInt(used) * GAS_ADJUSTMENT_PERCENT, 100n);
+  if (typeof used !== "string" || !/^\d{1,12}$/.test(used)) throw new Error(`The simulation of ${person.role}'s transaction answered HTTP ${response.status} with no gas figure. Nothing was sent.`);
+  return { ok: true, gasUsed: BigInt(used) };
+}
+
+/**
+ * Prices a native transaction the way packages/contracts/scripts/tx.ts does: simulated gas times
+ * 1.3, at 0.15 uqor per gas, refused under the chain's floor or above the server's native fee cap.
+ */
+export function feeForGas(gasUsed: bigint): Fee {
+  const gas = ceilDiv(gasUsed * GAS_ADJUSTMENT_PERCENT, 100n);
   const amount = ceilDiv(gas * GAS_PRICE_MILLI_UQOR, 1000n);
   if (amount < ceilDiv(gas * MIN_GAS_PRICE_MILLI_UQOR, 1000n) || amount > MAX_NATIVE_FEE_UQOR) throw new Error(`A simulated fee of ${amount} uqor is outside the bounds. Nothing was sent.`);
   return { amount: [{ denom: DENOM, amount: amount.toString() }], gas: gas.toString() };
+}
+
+/** The fee feeForGas sets from the chain's simulation of the exact transaction. */
+export async function simulatedFee(person: Person, mode: "classical" | "hybrid", messages: Messages): Promise<Fee> {
+  const sim = await simulateNative(person, mode, messages);
+  if (!sim.ok) throw new Error(`Simulation of ${person.role}'s transaction failed (HTTP ${sim.status}). Nothing was sent.`);
+  return feeForGas(sim.gasUsed);
 }
 
 /**

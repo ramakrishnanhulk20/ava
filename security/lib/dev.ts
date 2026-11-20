@@ -24,7 +24,16 @@ export interface DevRequest {
   /** Send the body in pieces with no content-length, so only a cap applied while reading can stop it. */
   chunked?: boolean;
   timeoutMs?: number;
+  /** Leave out the `x-ava: 1` header, as a request another site's page made a browser send would (C23). */
+  withoutAva?: boolean;
 }
+
+/**
+ * Our app's own marker. Every handler refuses a request without it with 403 cross_site before it
+ * counts or reads anything (packages/server/src/http.ts refuseCrossSite), so every request here
+ * carries it unless an attack is about leaving it out.
+ */
+export const AVA_HEADER = { "x-ava": "1" } as const;
 
 const LOOPBACK = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 
@@ -32,7 +41,8 @@ const LOOPBACK = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
  * One request to the local dev server, and only to it: the host and port are fixed here, and the
  * source must be a loopback address other than 127.0.0.1, which the demo bot's own sweep counts
  * under. The dev server takes the client IP from the socket (C23), so each source address is a
- * separate client to its rate limits.
+ * separate client to its rate limits. Carries AVA_HEADER unless `withoutAva` is set; a header of the
+ * same name in `headers` replaces it.
  *
  * @throws When the source is not such an address, the path does not start with "/", the server
  *   cannot be reached, or it takes longer than the timeout.
@@ -42,7 +52,7 @@ export async function dev(req: DevRequest): Promise<DevAnswer> {
   if (m === null || req.from === "127.0.0.1" || m.slice(1).some((o) => Number(o) > 255)) throw new Error(`${req.from} is not a loopback source address this suite may use.`);
   if (!req.path.startsWith("/")) throw new Error("A dev-server path starts with /.");
   const body = req.body === undefined ? undefined : typeof req.body === "string" ? Buffer.from(req.body, "utf8") : Buffer.from(req.body);
-  const headers: Record<string, string> = { ...req.headers };
+  const headers: Record<string, string> = { ...(req.withoutAva ? {} : AVA_HEADER), ...req.headers };
   if (body !== undefined && !req.chunked && headers["content-length"] === undefined) headers["content-length"] = String(body.length);
 
   return new Promise<DevAnswer>((resolve, reject) => {

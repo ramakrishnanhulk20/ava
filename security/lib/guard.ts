@@ -80,6 +80,18 @@ export function installFetchGuard(opts: { blobOrigin?: string } = {}): void {
 }
 
 /**
+ * Replaces globalThis.fetch with one that refuses every request, so an offline run cannot reach any
+ * network even through a library. Covers everything that goes through globalThis.fetch; the
+ * offline attacks make no other kind of request.
+ */
+export function installOfflineGuard(): void {
+  installed = true;
+  globalThis.fetch = (async (): Promise<Response> => {
+    throw new GuardRefused("Refusing a network request in an offline run.");
+  }) as typeof fetch;
+}
+
+/**
  * Refuses any transaction target or eth_call address that is not one of our two contracts,
  * compared as 20 bytes.
  *

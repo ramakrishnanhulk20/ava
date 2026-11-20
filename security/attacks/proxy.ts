@@ -1,6 +1,10 @@
 import { notRun, verdict, type Attack, type Probe, type Result } from "../lib/attack.ts";
 import type { Ctx } from "../lib/context.ts";
 import { dev, devOrReset, notConfigured, ownHeaders, said, type DevAnswer } from "../lib/dev.ts";
+import { boardAt } from "../lib/registry.ts";
+import { UPLOAD_LIMITS } from "../../packages/server/src/blob.ts";
+import { DEMO_CHALLENGE_LIMITS, DEMO_GUEST_CAP, DEMO_JOIN_LIMITS, RELAY_LIMITS, SPONSOR_LIMITS } from "../../packages/server/src/config.ts";
+import { DOCUMENT_TOKEN_LIMITS, DOCUMENT_VERIFY_LIMITS } from "../../packages/server/src/docupload.ts";
 import { PROXY_BODY_CAP, PROXY_LIMITS } from "../../packages/server/src/proxy.ts";
 
 const M = "/api/chain";
@@ -228,7 +232,7 @@ const noCors: Attack = {
       ["OPTIONS preflight to the proxy", await dev({ method: "OPTIONS", path: NODE_INFO, from, headers: { ...origin, "access-control-request-method": "GET" } })],
       ["GET an unknown proxy route with Origin", await dev({ method: "GET", path: `${M}/x`, from, headers: origin })],
       ["POST /api/relay with Origin and no JSON", await dev({ method: "POST", path: "/api/relay", from, headers: { ...origin, "content-type": "text/plain" }, body: "x" })],
-      ["POST /api/upload with Origin and a bad kind", await dev({ method: "POST", path: "/api/upload?kind=x", from, headers: origin, body: "x" })],
+      ["POST /api/upload with Origin and a bad kind", await dev({ method: "POST", path: "/api/upload?kind=x", from, headers: { ...origin, "content-type": "application/octet-stream" }, body: "x" })],
     ];
     if (answers.some(([, a]) => notConfigured(a))) return notRun("a dev-server route answers 503 not_configured");
     return verdict(answers.map(([label, a]) => ({ ok: ownHeaders(a), line: `${label} -> ${said(a)}, ${ownHeaders(a) ? "no access-control header" : "CARRIES AN ACCESS-CONTROL HEADER OR ANOTHER CONTENT TYPE"}` })), `from ${from}: `);
@@ -259,4 +263,105 @@ const xff: Attack = {
   },
 };
 
-export const attacks: readonly Attack[] = [doubleSlash, fullUrl, dotSegments, encodedSlash, query, badAddress, postPath, postOversize, methods, upgradeName, protocolFeatures, noCors, xff];
+/** How far past each endpoint's per-IP limit the cross-site requests go, so counting them would show as a 429. */
+const OVER_LIMIT = 5;
+
+interface Gate {
+  label: string;
+  method: "GET" | "POST";
+  path: string;
+  headers?: Record<string, string>;
+  /** A body the handler refuses once it has counted it, so nothing is issued, stored or sent. */
+  body?: string | Uint8Array;
+  limit: { perIp: number; windowSeconds: number };
+  /** What the handler answers this request with after counting it. */
+  normal: { status: number; error?: string };
+  /** The same-origin request at the end, where it is not the flood's (the proxy's flood stays off the upstream). */
+  real?: { path: string; normal: { status: number; error?: string } };
+  /** The normal answer, where it depends on live state: read just before the same-origin request, with a note for the evidence, or why it cannot be known. */
+  normalNow?: (ctx: Ctx) => Promise<{ normal: { status: number; error?: string }; note: string } | { why: string }>;
+}
+
+const JSON_EMPTY = { headers: JSON_HEADERS, body: "{}" } as const;
+
+/**
+ * A join's normal answer follows the demo board: at DEMO_GUEST_CAP members or more the bot answers
+ * 503 board_full before it reads the body or counts the IP (packages/server/src/demo.ts
+ * handleDemoJoin), and below it 400 bad_body for this body, after counting it.
+ */
+async function joinAnswerNow(ctx: Ctx): Promise<{ normal: { status: number; error?: string }; note: string } | { why: string }> {
+  const boardId = ctx.env.demoBoardId;
+  if (boardId === undefined) return { why: "/api/demo/join's normal answer depends on the demo board, and DEMO_BOARD_ID is not set in security/.env" };
+  const held = (await boardAt(ctx.client, boardId)).members.length;
+  if (held >= DEMO_GUEST_CAP) {
+    return {
+      normal: { status: 503, error: "board_full" },
+      note: `board ${boardId} held ${held} members just before, at its cap of ${DEMO_GUEST_CAP}, so the bot answers before its per-IP count and this control cannot show a 429; only the 403s above show the refusal`,
+    };
+  }
+  return { normal: { status: 400, error: "bad_body" }, note: `board ${boardId} held ${held} members just before, under its cap of ${DEMO_GUEST_CAP}` };
+}
+
+/** The eight public endpoints, each with its own per-IP limit as packages/server sets it. */
+const GATES: readonly Gate[] = [
+  { label: "/api/upload", method: "POST", path: "/api/upload?kind=envelope", headers: { "content-type": "application/octet-stream" }, body: new Uint8Array(64).fill(7), limit: UPLOAD_LIMITS, normal: { status: 400, error: "not_an_envelope" } },
+  { label: "/api/document/token", method: "POST", path: "/api/document/token", ...JSON_EMPTY, limit: DOCUMENT_TOKEN_LIMITS, normal: { status: 400, error: "bad_sha256" } },
+  { label: "/api/document/verify", method: "POST", path: "/api/document/verify", ...JSON_EMPTY, limit: DOCUMENT_VERIFY_LIMITS, normal: { status: 400, error: "bad_sha256" } },
+  { label: "GET /api/chain", method: "GET", path: `${M}/x`, limit: PROXY_LIMITS, normal: { status: 404, error: "unknown_route" }, real: { path: NODE_INFO, normal: { status: 200 } } },
+  { label: "/api/relay", method: "POST", path: "/api/relay", ...JSON_EMPTY, limit: RELAY_LIMITS, normal: { status: 400, error: "bad_body" } },
+  { label: "/api/demo/challenge", method: "POST", path: "/api/demo/challenge", ...JSON_EMPTY, limit: DEMO_CHALLENGE_LIMITS, normal: { status: 400, error: "bad_guest" } },
+  { label: "/api/demo/join", method: "POST", path: "/api/demo/join", ...JSON_EMPTY, limit: DEMO_JOIN_LIMITS, normal: { status: 400, error: "bad_body" }, normalNow: joinAnswerNow },
+  { label: "/api/sponsor", method: "POST", path: "/api/sponsor", ...JSON_EMPTY, limit: SPONSOR_LIMITS, normal: { status: 400, error: "bad_body" } },
+];
+
+/** Sends `n` requests one after another; counts the answers by status and code, and the ones refused as cross-site under our own headers. */
+async function tally(n: number, send: () => Promise<DevAnswer>): Promise<{ text: string; refused: number }> {
+  const counts = new Map<string, number>();
+  let refused = 0;
+  for (let i = 0; i < n; i++) {
+    const a = await send();
+    counts.set(said(a), (counts.get(said(a)) ?? 0) + 1);
+    if (a.status === 403 && a.error === "cross_site" && ownHeaders(a)) refused++;
+  }
+  return { text: [...counts].map(([k, c]) => `${c} x ${k}`).join(", "), refused };
+}
+
+const crossSite: Attack = {
+  id: "C23-cross-site",
+  claim: `What another site's page could make a browser send is refused before anything counts it: on each of the eight public endpoints, its per-IP limit plus ${OVER_LIMIT} requests without x-ava, then as many with x-ava and Sec-Fetch-Site cross-site, all answer 403 cross_site, and a same-origin request from that address afterwards still gets its normal answer, never 429.`,
+  costUqor: 0n,
+  costNote: "about 430 local requests whose bodies every handler would refuse anyway, and one registry read of the demo board; the one request that reaches the upstream is a node_info read",
+  async run(ctx) {
+    const probes: Probe[] = [];
+    const unready: string[] = [];
+    for (const g of GATES) {
+      const from = ctx.ips.fresh();
+      const n = g.limit.perIp + OVER_LIMIT;
+      const send = (headers: Record<string, string>, opts: { withoutAva?: boolean; path?: string } = {}): Promise<DevAnswer> =>
+        dev({ method: g.method, path: opts.path ?? g.path, from, headers: { ...g.headers, ...headers }, ...(g.body === undefined ? {} : { body: g.body }), ...(opts.withoutAva ? { withoutAva: true } : {}) });
+      const started = Date.now();
+      const bare = await tally(n, () => send({}, { withoutAva: true }));
+      const marked = await tally(n, () => send({ "sec-fetch-site": "cross-site" }));
+      const now = g.normalNow === undefined ? undefined : await g.normalNow(ctx);
+      if (now !== undefined && "why" in now) {
+        unready.push(now.why);
+        continue;
+      }
+      const real = await send({ "sec-fetch-site": "same-origin" }, g.real === undefined ? {} : { path: g.real.path });
+      const elapsed = Date.now() - started;
+      const want = now?.normal ?? g.real?.normal ?? g.normal;
+      if (notConfigured(real)) unready.push(`${g.label} answers ${said(real)}`);
+      const normal = real.status === want.status && (want.error === undefined || real.error === want.error) && ownHeaders(real);
+      // A count that expired before the last request could hide a 429, so the whole run must fit in one window.
+      const inWindow = elapsed < g.limit.windowSeconds * 1000;
+      probes.push({
+        ok: bare.refused === n && marked.refused === n && normal && inWindow,
+        line: `${g.label} from ${from}: ${n} without x-ava -> ${bare.text}, ${n} with x-ava and Sec-Fetch-Site cross-site -> ${marked.text}, then one same-origin -> ${said(real)} (its normal answer is ${want.status}${want.error === undefined ? "" : ` ${want.error}`}${now === undefined ? "" : `: ${now.note}`}), all within ${elapsed} ms${inWindow ? "" : `, PAST ITS ${g.limit.windowSeconds} s WINDOW`}`,
+      });
+    }
+    if (unready.length > 0) return notRun(`${unready.join(", ")}, so its last request cannot show that nothing was counted`);
+    return verdict(probes);
+  },
+};
+
+export const attacks: readonly Attack[] = [doubleSlash, fullUrl, dotSegments, encodedSlash, query, badAddress, postPath, postOversize, methods, upgradeName, protocolFeatures, noCors, xff, crossSite];

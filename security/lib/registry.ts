@@ -1,4 +1,4 @@
-import { Action, actionMessage, sealEpochKey, sha256, signAction } from "@ava/core";
+import { Action, actionMessage, sealEpochKey, sha256, signAction, type FreshEpochKey, type KemRecipient, type OpenedEpochKey } from "@ava/core";
 import { bytesToHex, encodeFunctionData, type Hex, type PublicClient } from "viem";
 import { boardRegistryAbi } from "../../packages/server/src/abi/boardRegistry.ts";
 import { REGISTRY } from "./guard.ts";
@@ -7,6 +7,9 @@ import { kemOf } from "./people.ts";
 
 export const abi = boardRegistryAbi;
 export { Action };
+
+/** An epoch key this suite made for a new epoch, or one it opened back from an envelope the chain recorded. */
+export type EpochKey = FreshEpochKey | OpenedEpochKey;
 
 /** Our signed actions live this long after the latest block, so a later probe in the same run still sees a live deadline. */
 export const DEADLINE_SECONDS = 1800;
@@ -109,13 +112,13 @@ export class LocalBlobs {
   }
 }
 
-/** Seals an epoch key to each address's ML-KEM key as qor_getKEMKey returns it for that address (C15). */
-export async function sealTo(addresses: readonly Hex[], boardRef: Hex, epoch: bigint, epochKey: Uint8Array): Promise<Uint8Array> {
-  const recipients = [];
+/** Seals an epoch key to each address as the KemRecipient pair qor_getKEMKey returns for that address (C15). */
+export async function sealTo(addresses: readonly Hex[], boardRef: Hex, epoch: bigint, epochKey: EpochKey): Promise<Uint8Array> {
+  const recipients: KemRecipient[] = [];
   for (const address of addresses) {
-    const kemPublicKey = await kemOf(address);
-    if (kemPublicKey === undefined) throw new Error(`${address} publishes no ML-KEM key; refusing to seal to it.`);
-    recipients.push({ address, kemPublicKey });
+    const recipient = await kemOf(address);
+    if (recipient === undefined) throw new Error(`${address} publishes no ML-KEM key; refusing to seal to it.`);
+    recipients.push(recipient);
   }
   return sealEpochKey({ registry: REGISTRY, boardRef, epoch, epochKey, recipients });
 }

@@ -1,16 +1,24 @@
-import { accountBytes, challengeMessage, signAction } from "@ava/core";
+import { accountBytes, challengeMessage, sameAccount, signAction, signChallenge } from "@ava/core";
 import { bytesToHex, getAbiItem, hexToBytes, type Hex } from "viem";
-import { REGISTRY_DEPLOY_BLOCK } from "../../packages/server/src/config.ts";
+import { DEMO_FREE_SEATS, DEMO_GUEST_CAP, REGISTRY_DEPLOY_BLOCK, SPONSOR_AMOUNT_UQOR } from "../../packages/server/src/config.ts";
+import { balanceOf, sleep } from "./chain.ts";
 import type { Ctx } from "./context.ts";
-import { dev, type DevAnswer } from "./dev.ts";
+import { dev, notConfigured, said, type DevAnswer } from "./dev.ts";
 import { REGISTRY } from "./guard.ts";
 import { DEMO_POOL, FILL_PROFILE, FILL_RANGE, type Person, type Profile } from "./identities.ts";
-import { abi } from "./registry.ts";
+import { standingOf } from "./people.ts";
+import { abi, boardAt, type Board } from "./registry.ts";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 const LOG_PAGE_BLOCKS = 10_000n;
 /** A join holds the bot's lock for up to 120 s and may wait 20 s for it. */
 const JOIN_TIMEOUT_MS = 150_000;
+
+/** The most members the demo board holds once a background pressure pass is done (C41). */
+export const SEATS_AFTER_PASS = DEMO_GUEST_CAP - DEMO_FREE_SEATS;
+/** How long the dev server's own background pass may take to free its seats, six removals at most. */
+export const PASS_WITHIN_MS = 180_000;
+const PASS_POLL_MS = 5_000;
 
 /** The 20 bytes as lowercase hex: one key per account whatever form named it. */
 export const key = (address: string): string => bytesToHex(accountBytes(address));
@@ -44,6 +52,48 @@ export function joinBody(guest: Person, c: Challenge, signature: Hex): string {
 /** The guest's own pure ML-DSA-87 signature over `bytes`, which @ava/core signs only in the challenge form. */
 export const signBytes = (guest: Person, bytes: Hex): Hex => bytesToHex(signAction(guest.pqc.secretKey, hexToBytes(bytes)));
 
+/**
+ * The join body the app sends: the signature comes from signChallenge, built from the challenge's
+ * fields and the latest block's timestamp, never from bytes the bot sent (the C33 mirror).
+ */
+export async function typedJoinBody(ctx: Ctx, guest: Person, c: Challenge): Promise<string> {
+  const block = await ctx.client.getBlock({ blockTag: "latest" });
+  const { signature } = signChallenge(guest.pqc.secretKey, { registry: REGISTRY, boardId: c.boardId, guest: guest.evm, botNonce: c.botNonce, expiry: c.expiry, latestBlockTimestamp: block.timestamp });
+  return joinBody(guest, c, bytesToHex(signature));
+}
+
+const SPONSOR_TRIES = 3;
+const SPONSOR_FUNDS_WITHIN_MS = 60_000;
+
+/**
+ * A fresh identity from `range` that our own sponsor has just funded: the first with no balance and
+ * no key, skipping any the sponsor says it funded before. Its standing is read from the chain.
+ *
+ * @returns The person and a line of evidence, or the reason there is none.
+ */
+export async function sponsoredGuest(ctx: Ctx, range: { from: number; to: number }, role: string): Promise<{ person: Person; line: string } | { why: string }> {
+  for (let index = range.from, tries = 0; index <= range.to && tries < SPONSOR_TRIES; index++) {
+    const person = await ctx.people.derive(index, role);
+    const before = await standingOf(person);
+    if (before.balance !== 0n || before.pqc.registered) continue;
+    tries++;
+    const a = await dev({ method: "POST", path: "/api/sponsor", from: ctx.ips.fresh(), headers: JSON_HEADERS, body: JSON.stringify({ address: person.qor1 }), timeoutMs: 90_000 });
+    if (notConfigured(a)) return { why: `the sponsor answers ${said(a)}` };
+    // An earlier run whose send failed leaves the once-only mark behind: take the next fresh identity.
+    if (a.status === 409 && a.error === "already_sponsored") continue;
+    if (a.status !== 202) return { why: `the sponsor answered ${said(a)} for the fresh identity ${person.qor1}` };
+    let balance = await balanceOf(person.qor1);
+    for (const started = Date.now(); balance < SPONSOR_AMOUNT_UQOR && Date.now() - started < SPONSOR_FUNDS_WITHIN_MS; ) {
+      await sleep(3_000);
+      balance = await balanceOf(person.qor1);
+    }
+    if (balance < SPONSOR_AMOUNT_UQOR) return { why: `the sponsor answered 202 for ${person.qor1}, which holds ${balance} uqor a minute later` };
+    const hash = (a.json as { txHash?: unknown } | undefined)?.txHash;
+    return { person, line: `${person.qor1} (index ${index}) sponsored in ${String(hash)}, holding ${balance} uqor` };
+  }
+  return { why: `no fresh identity was left to sponsor in indices ${range.from} to ${range.to}` };
+}
+
 export const join = (body: string, from: string): Promise<DevAnswer> => dev({ method: "POST", path: "/api/demo/join", from, headers: JSON_HEADERS, body, timeoutMs: JOIN_TIMEOUT_MS });
 
 /** A join's transaction hash, when it answered 202 with one. */
@@ -52,17 +102,138 @@ export function txHashOf(a: DevAnswer): Hex | undefined {
   return a.status === 202 && typeof h === "string" && /^0x[0-9a-f]{64}$/.test(h) ? (h as Hex) : undefined;
 }
 
-/** The whole guest flow, each step from its own address: challenge, sign, join, then the receipt. */
-export async function admit(ctx: Ctx, guest: Person): Promise<{ steps: string; answer?: DevAnswer; txHash?: Hex; landed: boolean }> {
+/** What a background pressure pass did, as the registry shows it: polled read-only, never asked for. */
+export interface PassSeen {
+  /** True once the board held SEATS_AFTER_PASS members or fewer within PASS_WITHIN_MS. */
+  reached: boolean;
+  ms: number;
+  /** The members the pass started from. */
+  from: readonly Hex[];
+  /** The board at the last read. */
+  to: Board;
+  /** Who in `from` is no longer a member. */
+  removed: Hex[];
+}
+
+/**
+ * Reads the registry, and never the server, until the demo board holds SEATS_AFTER_PASS members or
+ * fewer or PASS_WITHIN_MS has passed. The dev server's own background runner does the removing.
+ */
+export async function awaitPass(ctx: Ctx, boardId: bigint, from: readonly Hex[]): Promise<PassSeen> {
+  const started = Date.now();
+  let board = await boardAt(ctx.client, boardId);
+  while (board.members.length > SEATS_AFTER_PASS && Date.now() - started < PASS_WITHIN_MS) {
+    await sleep(PASS_POLL_MS);
+    board = await boardAt(ctx.client, boardId);
+  }
+  const to = board;
+  const removed = from.filter((m) => !to.members.some((n) => sameAccount(n, m)));
+  return { reached: to.members.length <= SEATS_AFTER_PASS, ms: Date.now() - started, from, to, removed };
+}
+
+/** A pass the way evidence lines quote it. */
+export const passLine = (p: PassSeen): string =>
+  `${p.reached ? "brought the board" : "DID NOT BRING THE BOARD"} to ${SEATS_AFTER_PASS} or fewer in ${Math.round(p.ms / 1000)} s (${p.from.length} members to ${p.to.members.length}), removing ${p.removed.join(", ") || "nobody"}`;
+
+export interface Admission {
+  steps: string;
+  /** The last join's answer. */
+  answer?: DevAnswer;
+  /** The join body that was answered 202, for a replay. */
+  body?: string;
+  txHash?: Hex;
+  landed: boolean;
+  /**
+   * The first join met a full board: the board just before it and just after its 503, the
+   * retry-after it gave, the background pass that then freed seats, and whether the join after
+   * that pass went on the first challenge (false when the server said it was gone, so a fresh one
+   * was asked for, and when the pass never freed seats, so no join followed).
+   */
+  full?: { before: Board; after: Board; retryAfter: string | undefined; pass: PassSeen; sameChallenge: boolean };
+  /** The background pass the admission started by leaving the board above SEATS_AFTER_PASS. */
+  pass?: PassSeen;
+}
+
+const admittedThisRun = new WeakMap<Ctx, Person[]>();
+
+/** Every guest admit() seated this run, in the order they were admitted. */
+export const ourGuests = (ctx: Ctx): readonly Person[] => admittedThisRun.get(ctx) ?? [];
+
+/** A join body over a fresh challenge, or the failed challenge's answer. */
+async function freshBody(guest: Person, ctx: Ctx): Promise<{ body: string } | { answer: DevAnswer; line: string }> {
   const asked = await askChallenge(guest, ctx.ips.fresh());
-  if (asked.challenge === undefined) return { steps: `challenge -> ${asked.answer.status} ${asked.answer.error ?? ""}`.trim(), answer: asked.answer, landed: false };
-  const body = joinBody(guest, asked.challenge, signBytes(guest, asked.challenge.message));
-  const answer = await join(body, ctx.ips.fresh());
+  if (asked.challenge === undefined) return { answer: asked.answer, line: `challenge -> ${said(asked.answer)}` };
+  return { body: joinBody(guest, asked.challenge, signBytes(guest, asked.challenge.message)) };
+}
+
+const membersKey = (b: Board): string => b.members.map(key).sort().join(",");
+
+/** The server's answers that a join's challenge can no longer be used: none is stored, or its expiry has passed. */
+const challengeGone = (a: DevAnswer): boolean => (a.status === 409 && a.error === "no_challenge") || (a.status === 403 && a.error === "challenge_expired");
+
+/**
+ * The guest flow a judge follows, each step from its own address: challenge, sign, join, then the
+ * receipt (C41). A join that answers 503 board_full is never a removal: the board is read right
+ * after it, the dev server's own background pass is waited for until the board holds
+ * SEATS_AFTER_PASS members or fewer, and the guest then sends the same join again, because the bot
+ * answers board_full before it reads the challenge or counts anything. Only when that answer says
+ * the challenge is gone does the guest ask for a fresh one and join once more. An admission that
+ * leaves the board above SEATS_AFTER_PASS starts a pass too, and that pass is waited for as well,
+ * so the next attack finds the board still.
+ *
+ * @param firstBody The first join's body, when the caller signed its own challenge; otherwise a
+ *   fresh challenge is asked for.
+ * @throws When DEMO_BOARD_ID is not set; callers report "not run" before that.
+ */
+export async function admit(ctx: Ctx, guest: Person, firstBody?: string): Promise<Admission> {
+  const boardId = ctx.env.demoBoardId;
+  if (boardId === undefined) throw new Error("DEMO_BOARD_ID is not set in security/.env.");
+  const steps: string[] = [];
+  let before = await boardAt(ctx.client, boardId);
+  let made = firstBody === undefined ? await freshBody(guest, ctx) : { body: firstBody };
+  if (!("body" in made)) return { steps: made.line, answer: made.answer, landed: false };
+  let body = made.body;
+  let answer = await join(body, ctx.ips.fresh());
+  let full: Admission["full"];
+  if (answer.status === 503 && answer.error === "board_full") {
+    const after = await boardAt(ctx.client, boardId);
+    const retryAfter = answer.headers["retry-after"];
+    const still = after.nonce === before.nonce && membersKey(after) === membersKey(before);
+    steps.push(
+      `join -> 503 board_full, retry-after ${retryAfter ?? "none"}; the board read just after: ${after.members.length} members, nonce ${after.nonce}, ${still ? "as just before" : `CHANGED from ${before.members.length} members, nonce ${before.nonce}`}`,
+    );
+    const pass = await awaitPass(ctx, boardId, before.members);
+    steps.push(`with no request from us, the background pass ${passLine(pass)}`);
+    if (!pass.reached) return { steps: steps.join("; "), answer, full: { before, after, retryAfter, pass, sameChallenge: false }, landed: false };
+    answer = await join(body, ctx.ips.fresh());
+    const sameChallenge = !challengeGone(answer);
+    full = { before, after, retryAfter, pass, sameChallenge };
+    before = pass.to;
+    if (sameChallenge) {
+      steps.push("the same join again, on the challenge board_full left in place");
+    } else {
+      steps.push(`the same join again -> ${said(answer)}, so a fresh challenge, signed`);
+      made = await freshBody(guest, ctx);
+      if (!("body" in made)) return { steps: [...steps, `fresh ${made.line}`].join("; "), answer: made.answer, full, landed: false };
+      body = made.body;
+      answer = await join(body, ctx.ips.fresh());
+    }
+  }
   const txHash = txHashOf(answer);
-  if (txHash === undefined) return { steps: `join -> ${answer.status} ${answer.error ?? ""}`.trim(), answer, landed: false };
+  if (txHash === undefined) return { steps: [...steps, `join -> ${said(answer)}`].join("; "), answer, ...(full === undefined ? {} : { full }), landed: false };
   const receipt = await ctx.client.waitForTransactionReceipt({ hash: txHash, timeout: 120_000, pollingInterval: 2_000 });
   history(ctx)?.admitted.add(key(guest.evm));
-  return { steps: `join -> 202 ${txHash}, ${receipt.status}`, answer, txHash, landed: receipt.status === "success" };
+  steps.push(`join -> 202 ${txHash}, ${receipt.status}`);
+  const landed = receipt.status === "success";
+  if (landed) admittedThisRun.set(ctx, [...ourGuests(ctx), guest]);
+  let pass: PassSeen | undefined;
+  // The bot starts a pass after any admission that leaves more than SEATS_AFTER_PASS members
+  // (packages/server/src/demo.ts admit), so the guest's own seat counts in the members it starts from.
+  if (landed && before.members.length + 1 > SEATS_AFTER_PASS) {
+    pass = await awaitPass(ctx, boardId, [...before.members, guest.evm]);
+    steps.push(`the background pass this admission started ${passLine(pass)}`);
+  }
+  return { steps: steps.join("; "), answer, body, txHash, landed, ...(full === undefined ? {} : { full }), ...(pass === undefined ? {} : { pass }) };
 }
 
 /** Who the demo board has ever admitted, and when each current member was added (block number), from the registry's own events. */
