@@ -442,15 +442,36 @@ const NOT_RUN_LIVE: readonly NotRunLive[] = [
     why: "the upstream is QoreChain's public REST, which this suite does not control and does not attack",
   },
   {
+    id: "C47-protected",
+    what: "a leave signed by the demo chair or a seeded director with its own key is refused, and removes nobody",
+    tests: [{ file: "demo.test.ts", names: ["never removes the chair or a seeded director this way, even with their own signature"] }],
+    why: "this suite holds no signing key of the demo chair or the seeded directors, so it cannot sign their leave",
+  },
+  {
+    id: "C47-refusals",
+    what: "a leave refused for a reason on the bot's side (the hour's demo relays are used up, another member's key cannot be read) removes nobody, and a leave request used up by a write whose reply was lost still serves once",
+    tests: [
+      {
+        file: "demo.test.ts",
+        names: [
+          "removes nobody when the hour has no demo relay left, and says when to come back",
+          "removes nobody while another member's key cannot be read, because the next epoch could not be sealed to it",
+          "serves one leave request once, even when the store lost the reply of the write that used it up",
+        ],
+      },
+    ],
+    why: "the suite cannot empty the bot's hourly relays, withdraw another member's key at the moment of a leave, or lose a store reply on the live server",
+  },
+  {
     id: "C40-model",
-    what: "sixteen properties of the relay, the demo bot and the document path, checked after every command of randomised runs against the real handlers and stores. Requests overlap at every store and chain call, the chain can be slow, lose a transaction, lose or falsify a receipt, or have its nonce used by a foreign key, and the store loses replies on most writes, increments included, with hour and day boundaries crossed. Among them: every handler answers; counters match the distinct actions handed to the node; no join removes anyone; admission marks stay true and none outlives a dead add; spend, shares and byte budgets hold; a write retried after a lost reply never understates a ledger; one action is in flight per nonce; a join refused for a full board or a busy bot leaves nothing behind",
+    what: "eighteen properties of the relay, the demo bot, its pack, a guest's signed leave and the document path, checked after every command of randomised runs against the real handlers and stores. Requests overlap at every store and chain call, the chain can be slow, lose a transaction, lose or falsify a receipt, or have its nonce used by a foreign key, and the store loses replies on most writes, increments included, with hour and day boundaries crossed. Among them: every handler answers; counters match the distinct actions handed to the node; no join removes anyone; admission marks stay true and none outlives a dead add; spend, shares and byte budgets hold; a write retried after a lost reply never understates a ledger; one action is in flight per nonce; a join refused for a full board or a busy bot leaves nothing behind; the bot posts one pack an epoch that every guest member opens; a leave removes only the account that signed it, once, and nobody taken off the board opens the current epoch",
     tests: [
       {
         file: "model/invariants.test.ts",
         names: [
           "every handler answers and none throws",
           "each per-board, per-chair and valid hourly counter holds no more than the distinct actions handed to the node in its window, and no fewer than those handed over there for the first time",
-          "no join removes anyone, even one that meets a board another join filled while it waited for the lock, and every removal is a sweep's or a pressure pass's, of a guest",
+          "no join removes anyone, even one that meets a board another join filled while it waited for the lock, and every removal is a sweep's, a pressure pass's or a leave's, of a guest",
           "every admission mark belongs to a member, a guest once seated, or an add still pending, and none survives a sweep once its add is dead",
           "every day's booked spend covers the real fees of what was handed over that day by the world clock, and is never negative",
           "the relayer halts exactly when a foreign transaction used its nonce, and never otherwise",
@@ -459,11 +480,13 @@ const NOT_RUN_LIVE: readonly NotRunLive[] = [
           "a write retried after a lost reply never makes a ledger or byte budget show less than was booked and not given back",
           "two different actions at one board nonce, or two copies of one action, are never both handed to the node while the first is pending",
           "a join answered board_full or demo_busy reserves no demo relay, takes nothing from the day, sends nothing and leaves no mark; one that met a board already full takes no hourly join and keeps its challenge",
-          "no removal takes the demo board below DEMO_GUEST_CAP minus DEMO_FREE_SEATS members unless its guest was due anyway: six hours old, or with a KEM key gone wrong",
+          "no sweep's or pass's removal takes the demo board below DEMO_GUEST_CAP minus DEMO_FREE_SEATS members unless its guest was due anyway: six hours old, or with a KEM key gone wrong",
           "each share of the day's spend, as the code booked it, stays at or under its ceiling",
           "a relay that moved the per-board, per-chair or valid hourly counters handed a transaction to the node, or was refused by one of those counters",
           "a dead add's mark never refuses its guest",
           "a guest never sent an add is never refused already_admitted or admission_unsettled, unless another join of it ran at the same time",
+          "the demo bot hands a pack to the node only for an epoch that has none, at most one lands per epoch, and every guest member holding the current epoch's key opens the bot's pack for it to the pack text's bytes",
+          "a leave removes the seat of the account that signed it and no other, at most once for each leave request, and only on that account's own signature over a leave request the bot issued; a leave its sender could have failed costs nothing; no leave admits; and nobody taken off the board opens a key of the current epoch",
         ],
       },
     ],

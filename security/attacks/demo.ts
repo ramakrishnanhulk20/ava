@@ -1,4 +1,4 @@
-import { Mode, accountBytes, openEpochKey, sameAccount, sameHash, sha256, toQor1 } from "@ava/core";
+import { Mode, accountBytes, challengeMessage, openEpochKey, sameAccount, sameHash, sha256, toQor1 } from "@ava/core";
 import { evmWindowCost } from "@qorechain/evm";
 import { parseEnvelope, recipientHint } from "@qorechain/qoreseal";
 import { bytesToHex, type Hex } from "viem";
@@ -8,7 +8,7 @@ import { COST, FILL_COST_EACH, notRun, verdict, type Attack, type Probe, type Re
 import { readBlob } from "../lib/blobs.ts";
 import { ethCall, feeForGas, formatQor, nativeTx, readEvmWindow, refusalOf, registryEvents, simulateNative, sleep, type CommittedTx } from "../lib/chain.ts";
 import type { Ctx } from "../lib/context.ts";
-import { PASS_WITHIN_MS, SEATS_AFTER_PASS, admit, askChallenge, demoHistory, fillGuests, freshGuest, join, joinBody, key, ourGuests, passLine, signBytes, sponsoredGuest, typedJoinBody, type PassSeen } from "../lib/demo.ts";
+import { PASS_WITHIN_MS, SEATS_AFTER_PASS, admit, askChallenge, askLeave, awaitPack, demoHistory, fillGuests, freshGuest, join, joinBody, key, leave, ourGuests, packLine, passLine, signBytes, sponsoredGuest, typedJoinBody, typedLeaveBody, type PassSeen } from "../lib/demo.ts";
 import { notConfigured, said, type DevAnswer } from "../lib/dev.ts";
 import { REGISTRY } from "../lib/guard.ts";
 import { FILL_RANGE, NOKEM_SPONSORED_RANGE, SHARED_KEM_SPONSORED_RANGE, SPONSORED_NOKEM_PROFILE, type Person } from "../lib/identities.ts";
@@ -203,9 +203,12 @@ const noKemGuest: Attack = {
     const guest = sponsored.person;
     await ctx.people.ensureAll([{ person: guest, profile: SPONSORED_NOKEM_PROFILE }]);
     const standing = await standingOf(guest);
+    // The bot's pack for the current epoch moves the nonce when it lands, so the stillness below is measured after it.
+    const settled = await awaitPack(ctx, boardId);
     const start = await boardAt(ctx.client, boardId);
     const probes: Probe[] = [
       { ok: isOurProvenKey(standing.pqc, guest) && standing.kem === undefined, line: `${sponsored.line}, its ML-DSA-87 key registered with a proof of possession, no ML-KEM key published` },
+      { ok: settled.reached, line: `before the joins, ${packLine(settled)}` },
     ];
     let moved: string | undefined;
     for (let i = 1; i <= FAILED_JOINS_ALLOWED + 1; i++) {
@@ -296,6 +299,8 @@ const sharedKem: Attack = {
       ok: seen !== undefined && sameBytes(seen.kemPublicKey, published.kemPublicKey),
       line: `the chain TAKES the copy: MsgRegisterKEMKey ${tx.hash} (fee ${tx.fee.amount[0]?.amount ?? "?"} uqor, paid by the guest); qor_getKEMKey(${guest.evm}) answers ${seen === undefined ? "no key" : sameBytes(seen.kemPublicKey, published.kemPublicKey) ? "Asha's key, byte for byte" : "a key that is not Asha's"}`,
     });
+    // The pack for the current epoch moves the nonce when it lands, so the board is read once it is on chain.
+    await awaitPack(ctx, boardId);
     const before = await boardAt(ctx.client, boardId);
     const asked = await askChallenge(guest, ctx.ips.fresh());
     if (notConfigured(asked.answer)) return notRun(`the challenge endpoint answers ${said(asked.answer)}, after the chain took the copy in ${tx.hash}`);
@@ -566,6 +571,140 @@ const badKey: Attack = {
   },
 };
 
-export const attacks: readonly Attack[] = [otherBytes, challengeSurvives, replay, once, perIp, sealed, noKem, noKemGuest, sharedKem, drill, badKey];
+/** The guest this run admitted last that is still on the demo board: the one whose seat the C47 attacks go after. */
+async function seatedGuest(ctx: Ctx, boardId: bigint): Promise<Person | undefined> {
+  const board = await boardAt(ctx.client, boardId);
+  return [...ourGuests(ctx)].reverse().find((g) => board.members.some((m) => sameAccount(m, g.evm)));
+}
+
+const sameMembers = (a: Board, b: Board): boolean => a.members.length === b.members.length && a.members.every((m) => b.members.some((n) => sameAccount(m, n)));
+
+const forgedLeave: Attack = {
+  id: "C47-forged-leave",
+  claim:
+    "Nobody is taken off the board by a leave it did not sign as a leave: for a guest on the board, another identity's valid signature over its leave bytes, its own signature over the join challenge's bytes for the same fields, a leave signed for a nonce the join challenge issued, and its valid leave sent to the join endpoint are all refused, and the guest stays a member.",
+  costUqor: 0n,
+  needs: ["dana"],
+  async run(ctx) {
+    const boardId = demoBoard(ctx);
+    if (typeof boardId !== "bigint") return boardId;
+    const guest = await seatedGuest(ctx, boardId);
+    if (guest === undefined) return notRun("no guest this run admitted is on the demo board");
+    const dana = await ctx.need("dana");
+    const asked = await askLeave(guest, ctx.ips.fresh());
+    if (notConfigured(asked.answer)) return notRun(`the leave request endpoint answers ${said(asked.answer)}`);
+    if (asked.challenge === undefined) return verdict([{ ok: false, line: `leave request -> ${said(asked.answer)}, not a request @ava/core rebuilds byte for byte` }]);
+    const c = asked.challenge;
+    const before = await boardAt(ctx.client, boardId);
+    const stranger = await leave(await typedLeaveBody(ctx, guest, c, dana), ctx.ips.fresh());
+    const joinBytes = bytesToHex(challengeMessage({ registry: REGISTRY, boardId: c.boardId, guest: guest.evm, botNonce: c.botNonce, expiry: c.expiry }));
+    const wrongTag = await leave(joinBody(guest, c, signBytes(guest, joinBytes)), ctx.ips.fresh());
+    const joinAsked = await askChallenge(guest, ctx.ips.fresh());
+    const onJoinNonce = joinAsked.challenge === undefined ? undefined : await leave(await typedLeaveBody(ctx, guest, joinAsked.challenge), ctx.ips.fresh());
+    const atJoin = await join(await typedLeaveBody(ctx, guest, c), ctx.ips.fresh());
+    const after = await boardAt(ctx.client, boardId);
+    return verdict([
+      { ok: true, line: `leave request for ${guest.evm}: 224 bytes, equal to @ava/core's leaveMessage for board ${c.boardId}` },
+      expect("Dana's valid signature over the guest's leave bytes", stranger, 403, "bad_signature"),
+      expect("the guest's own signature over the join challenge's bytes for the same fields", wrongTag, 403, "bad_signature"),
+      onJoinNonce === undefined
+        ? { ok: true, line: `a leave on a join challenge's nonce was not tried: the challenge endpoint answered ${said(joinAsked.answer)}` }
+        : { ok: (onJoinNonce.status === 403 && onJoinNonce.error === "challenge_mismatch") || (onJoinNonce.status === 409 && onJoinNonce.error === "no_challenge"), line: `the guest's valid leave signature for a nonce the join challenge issued -> ${said(onJoinNonce)}` },
+      { ok: atJoin.status !== 202, line: `the guest's valid leave sent to the join endpoint -> ${said(atJoin)}` },
+      { ok: sameMembers(before, after) && after.epoch === before.epoch, line: `${guest.evm} is still one of ${after.members.length} members at epoch ${after.epoch}, as before` },
+    ]);
+  },
+};
+
+const ownLeave: Attack = {
+  id: "C47-leave",
+  claim:
+    "A guest leaves by its own signature and takes nobody with it: its leave, signed as the app signs it, is answered 202, the removeMember lands with the registry's MemberRemoved for that guest alone, every other member stays, the epoch moves on by one, and the new epoch's envelope is the recorded bytes and refuses the guest's keys.",
+  costUqor: 0n,
+  serverUqor: COST.remove,
+  costNote: "our relayer pays the removal; the bot then posts its next pack for the new epoch",
+  async run(ctx) {
+    const boardId = demoBoard(ctx);
+    if (typeof boardId !== "bigint") return boardId;
+    if (ctx.env.blobOrigin === undefined) return notRun("BLOB_ORIGIN is not set in security/.env");
+    const guest = await seatedGuest(ctx, boardId);
+    if (guest === undefined) return notRun("no guest this run admitted is on the demo board");
+    const asked = await askLeave(guest, ctx.ips.fresh());
+    if (notConfigured(asked.answer)) return notRun(`the leave request endpoint answers ${said(asked.answer)}`);
+    if (asked.challenge === undefined) return verdict([{ ok: false, line: `leave request -> ${said(asked.answer)}` }]);
+    const before = await boardAt(ctx.client, boardId);
+    const body = await typedLeaveBody(ctx, guest, asked.challenge);
+    const a = await leave(body, ctx.ips.fresh());
+    const txHash = (a.json as { txHash?: unknown } | undefined)?.txHash;
+    if (a.status !== 202 || typeof txHash !== "string" || !/^0x[0-9a-f]{64}$/.test(txHash)) return verdict([{ ok: false, line: `the guest's own leave -> ${said(a)}` }]);
+    const receipt = await ctx.client.waitForTransactionReceipt({ hash: txHash as Hex, timeout: 120_000 });
+    const events = registryEvents(receipt);
+    const removed = events.filter((e) => e.eventName === "MemberRemoved");
+    const grant = events.find((e) => e.eventName === "EnvelopeGranted")?.args;
+    const after = await boardAt(ctx.client, boardId);
+    const pack = await awaitPack(ctx, boardId);
+    ctx.state.left = { person: guest, body, txHash: txHash as Hex };
+    const others = before.members.filter((m) => !sameAccount(m, guest.evm));
+    const probes: Probe[] = [
+      { ok: receipt.status === "success", line: `the guest's own leave -> 202 ${txHash}, ${receipt.status} in block ${receipt.blockNumber}` },
+      { ok: removed.length === 1 && sameAccount(String(removed[0]!.args.member), guest.evm) && BigInt(String(removed[0]!.args.boardId)) === boardId, line: `${removed.length} MemberRemoved from the registry, of ${removed.map((e) => String(e.args.member)).join(", ") || "nobody"}` },
+      { ok: !after.members.some((m) => sameAccount(m, guest.evm)) && others.every((m) => after.members.some((n) => sameAccount(m, n))), line: `the board held ${before.members.length} members, now ${after.members.length}: ${guest.evm} is gone and every other member stays` },
+      { ok: after.epoch === before.epoch + 1n, line: `epoch ${before.epoch} before, ${after.epoch} after` },
+      { ok: pack.reached, line: `after the leave, ${packLine(pack)}` },
+    ];
+    if (grant === undefined) return verdict([...probes, { ok: false, line: `${txHash} carries no EnvelopeGranted` }]);
+    const envelopeHash = String(grant.envelopeHash) as Hex;
+    const envelopeSize = Number(grant.envelopeSize);
+    const epoch = BigInt(String(grant.epoch));
+    const read = await readBlob(`${ctx.env.blobOrigin}/envelope/${envelopeHash.slice(2).toLowerCase()}`, envelopeSize + 1);
+    const bytes = read.bytes;
+    const hashOk = bytes !== undefined && bytes.length === envelopeSize && sameHash(bytesToHex(sha256(bytes)), envelopeHash);
+    probes.push({ ok: hashOk, line: `the new epoch's envelope from the blob origin: ${read.status}, ${bytes?.length ?? 0} bytes, sha256 ${hashOk ? "equals" : "DIFFERS FROM"} the on-chain record` });
+    if (hashOk) {
+      const open = (who: Person): string => {
+        try {
+          openEpochKey({ registry: REGISTRY, boardRef: after.boardRef, epoch, envelope: bytes, expectedHash: envelopeHash, expectedSize: envelopeSize, sealKeys: who.seal });
+          return "opened";
+        } catch (error) {
+          return String((error as { code?: unknown }).code ?? (error instanceof Error ? error.name : "error"));
+        }
+      };
+      const mine = open(guest);
+      probes.push({ ok: mine === "NOT_A_RECIPIENT", line: `the keys of the guest who left on the envelope of epoch ${epoch}: ${mine}` });
+      // A member that stayed must still open it, or the refusal above would prove nothing.
+      const stayed = ourGuests(ctx).find((g) => !sameAccount(g.evm, guest.evm) && after.members.some((m) => sameAccount(m, g.evm)));
+      probes.push(stayed === undefined ? { ok: true, line: "no other guest this run admitted is on the board, so no staying member's keys were tried on it" } : { ok: open(stayed) === "opened", line: `the keys of ${stayed.evm}, who stayed, on the same envelope: ${open(stayed)}` });
+    }
+    return verdict(probes);
+  },
+};
+
+const leaveOnce: Attack = {
+  id: "C47-leave-once",
+  claim:
+    "A leave request removes at most once and leaving is no way back in: the leave that removed the guest, sent again, is refused; a fresh leave the same account signs is refused because it holds no seat; and its valid join is refused because an address is admitted once.",
+  costUqor: 0n,
+  async run(ctx) {
+    const boardId = demoBoard(ctx);
+    if (typeof boardId !== "bigint") return boardId;
+    const l = ctx.state.left;
+    if (l === undefined) return notRun("C47-leave removed nobody");
+    const before = await boardAt(ctx.client, boardId);
+    const replayed = await leave(l.body, ctx.ips.fresh());
+    const again = await askLeave(l.person, ctx.ips.fresh());
+    const fresh = again.challenge === undefined ? undefined : await leave(await typedLeaveBody(ctx, l.person, again.challenge), ctx.ips.fresh());
+    const asked = await askChallenge(l.person, ctx.ips.fresh());
+    const rejoin = asked.challenge === undefined ? undefined : await join(await typedJoinBody(ctx, l.person, asked.challenge), ctx.ips.fresh());
+    const after = await boardAt(ctx.client, boardId);
+    return verdict([
+      expect("the leave that removed the guest, replayed", replayed, 409, "no_challenge"),
+      fresh === undefined ? { ok: false, line: `a fresh leave request for the account that left -> ${said(again.answer)}` } : expect("its fresh, valid leave", fresh, 409, "not_a_member"),
+      rejoin === undefined ? { ok: false, line: `a fresh join challenge for the account that left -> ${said(asked.answer)}` } : expect("its fresh, valid join", rejoin, 409, "already_admitted"),
+      { ok: sameMembers(before, after) && after.epoch === before.epoch, line: `the board holds the same ${after.members.length} members at epoch ${after.epoch}` },
+    ]);
+  },
+};
+
+export const attacks: readonly Attack[] = [otherBytes, challengeSurvives, replay, once, perIp, sealed, noKem, noKemGuest, sharedKem, drill, badKey, forgedLeave, ownLeave, leaveOnce];
 /** Runs before any other attack joins the demo board, so a board an older server left full meets C41 first. */
 export const seatAttacks: readonly Attack[] = [full];

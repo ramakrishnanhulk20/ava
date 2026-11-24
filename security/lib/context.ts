@@ -53,6 +53,8 @@ export interface SuiteState {
   demoGuest?: { person: Person; challenge: Challenge };
   /** The join that admitted the demo guest in C43, kept for its replay. */
   join?: { body: string; txHash: Hex };
+  /** The leave that took a guest off the demo board in C47-leave, kept for its replay. */
+  left?: { person: Person; body: string; txHash: Hex };
 }
 
 export class Ctx {

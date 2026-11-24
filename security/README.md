@@ -15,7 +15,7 @@ SDK. Each prints whether the defence held and saves what it saw.
 | `attacks/uploads.ts` | the dev server's envelope and document uploads, and our live blob store | C28, C29, C30, C44 |
 | `attacks/sponsor.ts` | the dev server's sponsor, on the live chain | C16, C27 |
 | `attacks/relay.ts` | the dev server's relayer, on the live chain | C9, C24, C25, C40, C44 |
-| `attacks/demo.ts` | the dev server's demo bot, on the live chain; `C41-full-board` runs as its own group, `seats`, before any other attack joins the demo board | C15, C33 to C36, C41 to C43 |
+| `attacks/demo.ts` | the dev server's demo bot, on the live chain; `C41-full-board` runs as its own group, `seats`, before any other attack joins the demo board | C15, C33 to C36, C41 to C43, C47 |
 
 - `npx tsx run.ts --list` prints every attack id with the line of section C it tries to break, then
   each promise proven by unit tests instead, with the test file and the exact test names, and checks

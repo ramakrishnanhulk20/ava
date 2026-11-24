@@ -58,6 +58,13 @@ export async function boardAt(client: PublicClient, id: bigint): Promise<Board> 
   };
 }
 
+/** The epoch of a board's newest pack, or undefined for a board with none. */
+export async function newestPackEpoch(client: PublicClient, board: Board): Promise<bigint | undefined> {
+  if (board.documentCount === 0) return undefined;
+  const doc = await client.readContract({ address: REGISTRY, abi, functionName: "getDocument", args: [board.id, BigInt(board.documentCount - 1)], blockNumber: board.blockNumber });
+  return doc.epoch;
+}
+
 export async function grantsOf(client: PublicClient, id: bigint, epoch: bigint): Promise<Grant[]> {
   const list = await client.readContract({ address: REGISTRY, abi, functionName: "getGrants", args: [id, epoch] });
   return list.map((g) => ({ envelopeHash: g.envelopeHash, envelopeSize: g.envelopeSize, mode: g.mode, member: g.member }));

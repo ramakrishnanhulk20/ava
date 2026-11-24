@@ -1,4 +1,4 @@
-import { accountBytes, challengeMessage, sameAccount, signAction, signChallenge } from "@ava/core";
+import { accountBytes, challengeMessage, leaveMessage, sameAccount, signAction, signChallenge, signLeave } from "@ava/core";
 import { bytesToHex, getAbiItem, hexToBytes, type Hex } from "viem";
 import { DEMO_FREE_SEATS, DEMO_GUEST_CAP, REGISTRY_DEPLOY_BLOCK, SPONSOR_AMOUNT_UQOR } from "../../packages/server/src/config.ts";
 import { balanceOf, sleep } from "./chain.ts";
@@ -7,7 +7,7 @@ import { dev, notConfigured, said, type DevAnswer } from "./dev.ts";
 import { REGISTRY } from "./guard.ts";
 import { DEMO_POOL, FILL_PROFILE, FILL_RANGE, type Person, type Profile } from "./identities.ts";
 import { standingOf } from "./people.ts";
-import { abi, boardAt, type Board } from "./registry.ts";
+import { abi, boardAt, newestPackEpoch, type Board } from "./registry.ts";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 const LOG_PAGE_BLOCKS = 10_000n;
@@ -30,19 +30,40 @@ export interface Challenge {
   message: Hex;
 }
 
-/**
- * Asks the bot for a guest challenge. The challenge counts only if the bytes it says to sign are
- * exactly the ones @ava/core builds from its fields, so the guest never signs bytes it did not check.
- */
-export async function askChallenge(guest: Person, from: string): Promise<{ answer: DevAnswer; challenge?: Challenge }> {
-  const answer = await dev({ method: "POST", path: "/api/demo/challenge", from, headers: JSON_HEADERS, body: JSON.stringify({ guest: guest.evm }) });
+type Fields = { registry: string; boardId: bigint; guest: string; botNonce: Hex; expiry: bigint };
+
+/** What one of the bot's two issuing endpoints answered, kept only if its bytes are the ones `build` makes from its fields. */
+async function issued(path: string, guest: Person, from: string, build: (p: Fields) => Uint8Array): Promise<{ answer: DevAnswer; challenge?: Challenge }> {
+  const answer = await dev({ method: "POST", path, from, headers: JSON_HEADERS, body: JSON.stringify({ guest: guest.evm }) });
   const j = answer.json as { registry?: unknown; boardId?: unknown; botNonce?: unknown; expiry?: unknown; message?: unknown } | undefined;
   if (answer.status !== 200 || typeof j?.boardId !== "string" || typeof j.botNonce !== "string" || typeof j.expiry !== "string" || typeof j.message !== "string" || typeof j.registry !== "string") return { answer };
   if (!/^[1-9][0-9]{0,77}$/.test(j.boardId) || !/^0x[0-9a-fA-F]{64}$/.test(j.botNonce) || !/^[1-9][0-9]{0,19}$/.test(j.expiry)) return { answer };
   const challenge = { boardId: BigInt(j.boardId), botNonce: j.botNonce as Hex, expiry: BigInt(j.expiry), message: j.message as Hex };
-  const rebuilt = bytesToHex(challengeMessage({ registry: REGISTRY, boardId: challenge.boardId, guest: guest.evm, botNonce: challenge.botNonce, expiry: challenge.expiry }));
+  const rebuilt = bytesToHex(build({ registry: REGISTRY, boardId: challenge.boardId, guest: guest.evm, botNonce: challenge.botNonce, expiry: challenge.expiry }));
   if (key(j.registry) !== key(REGISTRY) || rebuilt.toLowerCase() !== challenge.message.toLowerCase()) return { answer };
   return { answer, challenge };
+}
+
+/**
+ * Asks the bot for a guest challenge. The challenge counts only if the bytes it says to sign are
+ * exactly the ones @ava/core builds from its fields, so the guest never signs bytes it did not check.
+ */
+export const askChallenge = (guest: Person, from: string): Promise<{ answer: DevAnswer; challenge?: Challenge }> => issued("/api/demo/challenge", guest, from, challengeMessage);
+
+/** Asks the bot for a guest's leave request (C47), kept only if its bytes are exactly @ava/core's leaveMessage for its fields. */
+export const askLeave = (guest: Person, from: string): Promise<{ answer: DevAnswer; challenge?: Challenge }> => issued("/api/demo/leave/challenge", guest, from, leaveMessage);
+
+export const leave = (body: string, from: string): Promise<DevAnswer> => dev({ method: "POST", path: "/api/demo/leave", from, headers: JSON_HEADERS, body, timeoutMs: JOIN_TIMEOUT_MS });
+
+/**
+ * A leave body for `guest` whose signature comes from signLeave, built from the request's fields and
+ * the latest block's timestamp. Signed with the guest's own key it is the leave the app sends; with
+ * another `signer` it is that identity's valid signature over the guest's leave bytes.
+ */
+export async function typedLeaveBody(ctx: Ctx, guest: Person, c: Challenge, signer: Person = guest): Promise<string> {
+  const block = await ctx.client.getBlock({ blockTag: "latest" });
+  const { signature } = signLeave(signer.pqc.secretKey, { registry: REGISTRY, boardId: c.boardId, guest: guest.evm, botNonce: c.botNonce, expiry: c.expiry, latestBlockTimestamp: block.timestamp });
+  return joinBody(guest, c, bytesToHex(signature));
 }
 
 export function joinBody(guest: Person, c: Challenge, signature: Hex): string {
@@ -131,6 +152,36 @@ export async function awaitPass(ctx: Ctx, boardId: bigint, from: readonly Hex[])
   return { reached: to.members.length <= SEATS_AFTER_PASS, ms: Date.now() - started, from, to, removed };
 }
 
+/** How long the bot may take to post its pack for a new epoch: the post follows an admission or a removal in the background. */
+export const PACK_WITHIN_MS = 180_000;
+
+/** The bot's pack for the demo board's current epoch, as the registry shows it. */
+export interface PackSeen {
+  /** True once the board's newest pack was for its current epoch within PACK_WITHIN_MS. */
+  reached: boolean;
+  ms: number;
+  epoch: bigint;
+}
+
+/**
+ * Reads the registry, and never the server, until the demo board's newest pack is for its current
+ * epoch or PACK_WITHIN_MS has passed. The bot posts that pack in the background after every
+ * admission and every removal (C41), and the post moves the board's nonce, so an attack that needs
+ * a still board waits for it first.
+ */
+export async function awaitPack(ctx: Ctx, boardId: bigint): Promise<PackSeen> {
+  const started = Date.now();
+  for (;;) {
+    const board = await boardAt(ctx.client, boardId);
+    const reached = (await newestPackEpoch(ctx.client, board)) === board.epoch;
+    if (reached || Date.now() - started >= PACK_WITHIN_MS) return { reached, ms: Date.now() - started, epoch: board.epoch };
+    await sleep(PASS_POLL_MS);
+  }
+}
+
+/** A pack wait the way evidence lines quote it. */
+export const packLine = (p: PackSeen): string => (p.reached ? `the bot's pack for epoch ${p.epoch} is on chain (seen after ${Math.round(p.ms / 1000)} s)` : `NO PACK for epoch ${p.epoch} within ${Math.round(p.ms / 1000)} s`);
+
 /** A pass the way evidence lines quote it. */
 export const passLine = (p: PassSeen): string =>
   `${p.reached ? "brought the board" : "DID NOT BRING THE BOARD"} to ${SEATS_AFTER_PASS} or fewer in ${Math.round(p.ms / 1000)} s (${p.from.length} members to ${p.to.members.length}), removing ${p.removed.join(", ") || "nobody"}`;
@@ -179,7 +230,7 @@ const challengeGone = (a: DevAnswer): boolean => (a.status === 409 && a.error ==
  * answers board_full before it reads the challenge or counts anything. Only when that answer says
  * the challenge is gone does the guest ask for a fresh one and join once more. An admission that
  * leaves the board above SEATS_AFTER_PASS starts a pass too, and that pass is waited for as well,
- * so the next attack finds the board still.
+ * and then the bot's pack for the epoch the board ends in, so the next attack finds the board still.
  *
  * @param firstBody The first join's body, when the caller signed its own challenge; otherwise a
  *   fresh challenge is asked for.
@@ -233,6 +284,7 @@ export async function admit(ctx: Ctx, guest: Person, firstBody?: string): Promis
     pass = await awaitPass(ctx, boardId, [...before.members, guest.evm]);
     steps.push(`the background pass this admission started ${passLine(pass)}`);
   }
+  if (landed) steps.push(packLine(await awaitPack(ctx, boardId)));
   return { steps: steps.join("; "), answer, body, txHash, landed, ...(full === undefined ? {} : { full }), ...(pass === undefined ? {} : { pass }) };
 }
 
