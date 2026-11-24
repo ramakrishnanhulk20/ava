@@ -1,0 +1,97 @@
+---
+title: Security
+description: What Ava protects, what it does not, and how each promise was attacked on the live testnet.
+---
+
+## What Ava promises
+
+Four promises. Each is checked by the chain or by your own browser, not by our word.
+
+| Promise | What makes it true |
+|---|---|
+| Only the chair changes a board | Every change carries the chair's ML-DSA-87 signature, and the registry has QoreChain's `pqcVerify` check it before anything changes. Who sends the transaction does not matter. |
+| Only the people the chair chose can open a pack | The board key is sealed to each director's ML-KEM-1024 key, which the chair's browser reads from the chain itself. |
+| A removed director cannot open what comes next | Removing them and giving the board a new key are one transaction. The new key is never sealed to the person removed. |
+| Our server cannot read or change your board | It handles ciphertext, hashes and signatures. It holds no board key and no chair's key. |
+
+The one exception to the last row is the public demo board, whose chair is a bot of ours. See [The Q-Day Drill](/docs/drill).
+
+## What your browser does for you
+
+| What it does | How |
+|---|---|
+| Secrets stay on the device | Your recovery words are stored only encrypted, under your passphrase (PBKDF2-SHA-256 with 600,000 rounds, then AES-256-GCM). The open identity lives in memory for one page view. A reload asks for the passphrase again. |
+| It signs only what it built | Every message your keys sign is assembled in the browser from typed fields: this board, this action, this nonce. Bytes or hashes a server hands over are never signed. |
+| It believes the chain, not us | A reply from our relay is treated as a claim. A change counts as done only when the browser has read the transaction's receipt and found the registry's own event for that board and nonce. |
+| It reads keys from the chain | A director's sealing key comes from QoreChain's registry, read directly. Our server is never asked whose key is whose. |
+| Only this site's own scripts run | Every page is served with a Content-Security-Policy built around a one-time code made for that response. A script without the code does not run, no outside host is trusted for scripts, and the page may talk only to this site, the chain's public endpoint and the encrypted store. |
+| A pack cannot run code | A decrypted pack is never shown as a web page on this site. Plain text is shown as text, and PNG or JPEG images inside a locked frame that can run no script and reach nothing. The type is decided from the file's bytes, not its name. Everything else, HTML, SVG and PDF included, is offered as a download under a cleaned filename. |
+| The ledger checks the envelopes | For every key envelope a board has recorded, the board room downloads it, checks its hash, and counts its entries against the people it should name. An extra reader shows as an unknown reader, and an envelope that cannot be checked shows as unverified, never as clean. |
+
+## What Ava does not defend against
+
+| Not defended | Why |
+|---|---|
+| A member who shares what they read | Anyone who can open a pack can copy it. |
+| Packs a removed director could already open | They held those keys. Removal shuts the packs that come after it, nothing before. |
+| A chair who chooses badly | The chair decides who reads. The ledger shows every reader the chair sealed a key to; it cannot stop the chair from adding one. |
+| A compromised device | Malware, or a browser extension that can read this site's pages, sees what you see while your identity is open. |
+| A weak passphrase | Someone who copies the encrypted identity out of your browser can guess passphrases offline. Ten characters is the minimum, not a recommendation. |
+| Lost recovery words | Nobody can restore an identity without them. |
+| The code this site serves | You type your passphrase into a page we serve. If our deployment were taken over, it could serve a page that steals it. That is true of every web app that holds keys in the browser. |
+| What the chain shows | Who chairs a board, which addresses are members, when each change happened, and the size and time of every pack are public. |
+| Loss of the stored ciphertext | The chain keeps each pack's hash, not its bytes. If our store lost a pack and nobody kept a copy, the pack is gone. |
+| Our relay saying no | It can refuse or be offline. It cannot change a board, and a chair's signed change can be submitted by any funded account. |
+| A break in the schemes themselves | Ava rests on ML-DSA-87, ML-KEM-1024, AES-256-GCM and on QoreChain's signature check and key registry. |
+
+Ava runs on a testnet that can be reset, and it has had no outside audit.
+
+## How it was tested
+
+### Tests
+
+| Where | Tests |
+|---|---|
+| The registry contract | 139 |
+| The shared library (messages, signing, sealing) | 80 |
+| The server (relay, sponsor, uploads, demo bot) | 320 |
+| The web app | 135 |
+
+### A randomised test of timing and order
+
+Most of what goes wrong in a relay goes wrong in the order of things: two requests at once, a reply that is lost, a retry. One test plays random sequences of joins, leaves, posts, retries and lost replies against the server and checks 18 promises after every step.
+
+- The normal suite plays 300 sequences. A deep run plays 2,000.
+- In the last deep run all 18 promises held across 1,977 pack posts, 64,493 pack opens, 1,192 accepted leaves and 2,015 forged ones.
+- To check that the test can fail, 18 bugs were planted in the code one at a time. It caught every one.
+- It found 8 ordering bugs that reading the code had missed. All are fixed.
+
+### Attacks on the live testnet
+
+The repository holds an attack suite with one attack for each promise in the threat model. It runs against the deployed registry and our own server, with real transactions.
+
+| Last run | 23 November 2026, 52 minutes |
+|---|---|
+| Attacks | 77 |
+| Held | 76 |
+| Got through | 0 |
+| Not run | 1 |
+
+The one not run is `C36-drill-key`. It needs the key the Q-Day Drill's organisers publish, and until it has run we do not count it as passed.
+
+Every run's full evidence, with the transaction hash behind each line, is saved in [`security/results/`](https://github.com/ramakrishnanhulk20/ava/tree/main/security/results).
+
+### Our own audit
+
+Before any screen was built, the contract, the message format, the encryption, the relay, the demo bot and the uploads were each read through separately. That found 11 important issues, and three reviews of the fixes found 11 more gaps. All 22 are fixed, each with a test that failed before the fix.
+
+## Try to break it yourself
+
+- The [proof page](/proof) runs four attacks from your own browser as it loads, and shows the chain's answer to each.
+- The attack suite runs from the repository with a funded testnet account. [`security/README.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/security/README.md) says how.
+
+If you find a way through, open an issue on the repository with the steps.
+
+## The full record
+
+[`docs/security/threat-model.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/docs/security/threat-model.md) holds all 47 numbered rules, the code and the test that uphold each one, and what each does not cover.

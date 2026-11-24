@@ -1,0 +1,45 @@
+---
+title: The Q-Day Drill
+description: The demo board's chair handed its ordinary key to an attacker on 18 November 2026. Here is what that key can and cannot do.
+---
+
+## What the drill was
+
+On 18 November 2026 the fest ran a 24-hour drill. Each team registered one testnet account its project really uses and gave the organisers that account's ordinary ECDSA key. A bot holding the key then tried what that key allows.
+
+We registered the account that matters most to Ava: the chair of the public demo board.
+
+| | |
+|---|---|
+| Account | `qor1g7rde5fszsedm7hktcxs389aa7nve63y4hpfwy` |
+| Same account, EVM form | `0x4786dCd1301432DDFaF65e0d089CbDEFA6ccEa24` |
+| Its job | Chair of the demo board, and nothing else |
+
+## Why the key buys nothing on a board
+
+A Q-Day attacker is someone who can derive an ordinary private key from what is public. The drill hands them the same thing. On Ava it gets them this far:
+
+| What the key gets | Why |
+|---|---|
+| No board change | Every change to a board must carry the chair's ML-DSA-87 signature, and the registry checks it against the key QoreChain holds for the chair. Who sends the transaction does not matter. The [proof page](/proof) sends a change from the chair's own address with no ML-DSA-87 signature, live, and shows the registry refuse it. |
+| No way to make that signature | The chair's ML-DSA-87 and ML-KEM-1024 keys come from its recovery words, which never left our server. They cannot be worked out from the ordinary key. |
+| No pack | Packs are sealed to ML-KEM-1024 keys. The ordinary key opens none of them. |
+| No standing permission to spend | The account keeps no open EVM window, so the ordinary key finds nothing it is allowed to send through. |
+| No shortcut through us | No endpoint of ours accepts an ordinary signature, a wallet login or a sender address as authority. |
+
+## What we changed because of the drill
+
+The drill made one thing plain: once the ordinary key is public, the chair's ML-DSA-87 key is the whole account. So:
+
+- that key lives only in server secrets and is read by one code path, the demo bot's;
+- the bot never signs bytes a request hands it. It builds each message itself from its own reads of the chain;
+- relayer, sponsor and demo chair are three separate accounts, and the server refuses to start if any two share a recovery phrase;
+- a written procedure exists for the day that key leaks: rotate it on chain, then confirm the new key through `pqcKeyStatus`.
+
+## What is still open
+
+The organisers publish the drill keys after the drill. Our attack suite has one attack, `C36-drill-key`, that runs the drill's whole list of moves from the chair's own account with the published key. Until the key is out, that attack is recorded as **not run**, and we do not count it as passed.
+
+## What the drill does not show
+
+It says nothing about an attacker who holds the chair's ML-DSA-87 key, or the chair's device. That attacker is the chair. See [Security](/docs/security) for the full list of what Ava does not defend against.

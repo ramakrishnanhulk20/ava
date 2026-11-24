@@ -1,0 +1,63 @@
+---
+title: How it works
+description: Three moves, seal, sign and remove, and the QoreChain pieces each one rests on.
+---
+
+The browser does all the secret work. The server passes along public data, hashes, signatures and ciphertext. The chain is the one record of who sits on each board and what the next legal change is.
+
+<SystemDiagram />
+
+## Your identity
+
+When you first open the [board room](/board) or the [demo](/demo), your browser makes 24 recovery words and derives three things from them.
+
+| Key | Scheme | What it does |
+|---|---|---|
+| Signing key | ML-DSA-87 (FIPS 204) | Signs every change a chair makes to a board. |
+| Sealing key | ML-KEM-1024 (FIPS 203) | Lets a chair seal a board key to you, so that only you can open it. |
+| Account key | secp256k1 | Pays the two small fees that put the other keys on chain. |
+
+The words are locked in your browser with a passphrase you choose (PBKDF2-SHA-256 with 600,000 rounds, then AES-256-GCM). They never leave the device. Both public keys are registered on QoreChain: the signing key with a proof that you hold it, the sealing key in the chain's key registry.
+
+## Seal
+
+A board has one secret key at a time. Each version of it is called an epoch.
+
+- The chair's browser reads each director's ML-KEM-1024 key **from the chain**, never from our server, and seals the board key to all of them in one small envelope with QoreSeal.
+- A pack is encrypted with AES-256-GCM under a key derived from the board key and the pack's own reference. The pack's name travels inside the encrypted bytes; the chain never sees a name.
+- The envelope and the pack are stored as ciphertext under their SHA-256 hashes. The chain records those hashes and sizes, so a swapped or changed file does not match.
+
+## Sign
+
+Every change to a board is one message of exactly 256 bytes: the chain id, the registry's address, the board, the action, a hash of its details, the board's nonce and a deadline at most an hour ahead. The chair signs it with ML-DSA-87.
+
+The BoardRegistry contract builds the same 256 bytes itself, reads the chair's registered key through QoreChain's `pqcKeyStatus`, and has QoreChain's `pqcVerify` check the signature. Because the contract does this, not our server:
+
+- anyone may submit a signed change, and the sender gains nothing by it;
+- a signature for one board, one nonce or one registry is worth nothing anywhere else;
+- the chair's ordinary key, on its own, changes nothing.
+
+You can watch the chain refuse each of these on the [proof page](/proof).
+
+## Remove
+
+<RemovalSequence />
+
+Removing a director and giving the board a new key are one transaction. There is no moment in which the director is gone and the old key is still the board's key.
+
+<EpochTimeline />
+
+## What the server can and cannot do
+
+| It can | It cannot |
+|---|---|
+| Relay a signed change and pay its fee | Change a signed change, or make one |
+| Give a new identity a little test QOR, once | Read a pack or a board key |
+| Store ciphertext and check its hash | Tell a chair which key belongs to a director |
+| Refuse a request, or be offline | Add or remove anyone on your board |
+
+If our server vanished, every board would still be on chain and every member could still open their packs from any copy of the stored ciphertext. A different relayer, or the chair's own funded account, could submit the chair's signed changes.
+
+## The demo board is a special case
+
+The public demo board's chair is a bot of ours, so judges can join without waiting for a person. On that one board our server holds the chair's key and writes the demo pack. On a board you create yourself, the chair is you, and none of that applies.

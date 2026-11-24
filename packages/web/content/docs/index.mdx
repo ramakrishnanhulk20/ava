@@ -1,0 +1,51 @@
+---
+title: What Ava is
+description: A board room where every pack is sealed for today's directors, and a director who is removed is shut out of the next one.
+---
+
+Ava is named after the Tamil word avai (அவை), the assembly where a council meets.
+
+## The problem
+
+A company's board gets its papers as PDFs in email or through a portal the company has to trust. Two things go wrong with that.
+
+- A removed director keeps their access until someone remembers to switch it off, and nobody can show afterwards what they could still read.
+- Whatever protects those papers today can be recorded today and broken later. A board pack about an acquisition is still worth reading in ten years, when a large quantum computer may open what ordinary encryption locked.
+
+## What Ava does
+
+- Every pack is encrypted in the chair's browser. The key is sealed, with the ML-KEM-1024 scheme through QoreChain's QoreSeal kit, to the directors' own keys as QoreChain publishes them. Our servers and our storage only ever hold ciphertext.
+- Every change to a board needs the chair's ML-DSA-87 signature, and the chain checks it. Adding a director, removing one, posting a pack: the BoardRegistry contract verifies the signature itself against the chair's registered key. A stolen ordinary key adds nobody and posts nothing.
+- Removing a director gives the board a new key. It is sealed to everyone who stays, in the same transaction that removes the one who leaves. The next pack is shut to them, and the ledger shows it: what they kept, what they lost, and the transaction behind each.
+
+Ava does not pretend the removed director forgets what they already read. They keep every pack they could open before. The ledger says so in plain words.
+
+## What you can check for yourself
+
+Two things here need no trust in us, and no wallet.
+
+- The ledger in [your board room](/board) shows what a removed director kept: pack by pack, what they could open before and what is shut to them now, each line with the transaction behind it.
+- Your own browser runs the proof. [Attack it](/proof) sends four attacks to the chain as the page loads. On [the demo board](/demo) you leave by your own signature and watch your browser fail to open the next pack with every key it holds.
+
+## What is live
+
+Everything runs on the QoreChain testnet (`qorechain-diana`, EVM chain id 9800).
+
+| Where | What you can do |
+|---|---|
+| [The demo board](/demo) | Join a public board in about a minute, open a pack sealed to you, then leave and watch the next pack stay shut. |
+| [Your board room](/board) | Create your own board, add directors by their address, post any file as a pack, remove a director, and check the ledger. |
+| [Attack it](/proof) | Four attacks on the demo board that your own browser runs against the chain as the page loads. |
+
+## Who it is for
+
+A chair or company secretary who has to hand confidential papers to a small group, change that group now and then, and later show who could read what. The first version is built for a board of up to 64 people.
+
+## Where to go next
+
+- [For judges](/docs/judges): the two-minute path, where each criterion shows, and real transactions to click.
+- [How it works](/docs/how-it-works): the three moves, seal, sign and remove, and what each one rests on.
+- [Getting started](/docs/getting-started): try the demo, run a board, or run the code.
+- [Architecture and failure cases](/docs/architecture): the pieces, how one change travels, and what happens when each part fails.
+- [Contracts and addresses](/docs/contracts): what is deployed and how to check it.
+- [Security](/docs/security): what Ava protects, what it does not, and how each promise is tested.

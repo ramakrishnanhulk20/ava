@@ -1,0 +1,48 @@
+---
+title: Questions
+description: Short answers to what people ask first.
+---
+
+## Do I need a wallet?
+
+No. Your browser makes your identity, and our sponsor account sends it a little test QOR once, enough to put its two keys on chain. After that, our relay pays the fee for each change a chair signs.
+
+## Can Ava read my packs?
+
+No. A pack is encrypted in the chair's browser before anything is uploaded, and its key is sealed to the directors' own keys. We store ciphertext. The one exception is the public demo board, whose chair is a bot of ours: there, our server writes the demo pack.
+
+## A director was removed. Can they still read old packs?
+
+Yes, every pack they could open before. They held those keys, and nothing can take that back. What removal guarantees is that packs posted **afterwards** are shut to them. The ledger in the board room shows both sides for each person.
+
+## What if I lose my device?
+
+Your identity comes back from its 24 recovery words: in the board room choose **I have recovery words**. Without the words it is gone, and so is your access to your boards. We cannot restore it, because we never had it.
+
+## What if I forget my passphrase?
+
+The passphrase only locks the recovery words in one browser. With the words, forget the identity in that browser and restore it under a new passphrase. Without the words, nothing can open it.
+
+## What does the chain know about my board?
+
+Who the chair is, which addresses are members, when each change happened, and each pack's hash, size and time. It does not know a board's name, a director's name, or what any pack says or is called.
+
+## What happens if Ava's server goes away?
+
+Every board stays on chain. Members can still open their packs from any copy of the stored ciphertext, because the keys are in their browsers. The chair's signed changes can be submitted by anyone with a funded account; our relay is a convenience, not an authority.
+
+## Why QoreChain?
+
+Ava needs three things from a chain and QoreChain has all three built in: a registry of ML-KEM-1024 keys to seal to, registered ML-DSA-87 keys with proof of possession, and a way for a contract to verify an ML-DSA-87 signature. Without the third, a server would have to be trusted to check signatures, and removing a director would be a promise instead of a fact.
+
+## Why does a change take about half a minute?
+
+Our relay simulates the exact transaction, takes a lock so that two changes never collide, checks its spending limits, sends, and waits for the block. Each step is there because skipping it once cost somebody else money or a seat. The page says what it is doing while you wait.
+
+## Is this ready for a real company's board?
+
+Not yet. It runs on a testnet, it has had our own audit and attack runs but no outside audit, and it is built for a hackathon. The honest list of what it does not defend against is on the [Security](/docs/security) page.
+
+## How big can a board and a pack be?
+
+Up to 64 members, and packs up to 25 MB each.

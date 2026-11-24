@@ -1,0 +1,95 @@
+---
+title: Contracts and addresses
+description: What is deployed on the QoreChain testnet, what it records, and how to check it yourself.
+---
+
+## Deployed
+
+Network: `qorechain-diana`, EVM chain id 9800.
+
+| Contract | EVM address | On the explorer | Deployed in block |
+|---|---|---|---|
+| BoardRegistry | `0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa` | [`qor19we5...46x0`](https://explore.qore.network/address/qor19we57c9jn3auzrm7es94q5pjn6qgmt96qe46x0) | 10,235,963, [deployment](https://explore.qore.network/tx/BF969C6F71ACBDD4F4085F81E73E01E4A9B49A33D52893B8DB60E2157958D0AE) |
+| PqcProbe | `0x624b5C35E3665eB9ade6d75BBbca1218a09E00D1` | [`qor1vf94...zjly`](https://explore.qore.network/address/qor1vf94cd0rve0tnt0x6admhjsjrzsfuqx3l9zjly) | 10,181,860 |
+
+The explorer opens on mainnet. Press **Testnet** in its top bar once and it remembers.
+
+BoardRegistry is the product. PqcProbe was the first check that a deployed contract can verify a real ML-DSA-87 signature through QoreChain's precompiles.
+
+The registry has **no owner, no admin, no pause and no upgrade path**, and it accepts no value. Nobody, the deployer included, can change a board except its chair, and only by signature.
+
+## Check the code yourself
+
+Sourcify does not list chain 9800, and the explorer offered no source submission when the registry was deployed. The check is the code itself:
+
+1. Build `packages/contracts` with the pinned compiler (Solidity 0.8.38, EVM version prague, optimizer on, 200 runs).
+2. Read the deployed code with `eth_getCode` from `https://evm-testnet.qore.host`.
+3. Compare their keccak256.
+
+With Foundry installed, both commands print the same hash:
+
+```bash
+cd packages/contracts
+cast code 0x2bB34f60B29C7bC10f7ECC0B5050329E808DAcBa --rpc-url https://evm-testnet.qore.host | cast keccak
+forge inspect BoardRegistry deployedBytecode | cast keccak
+# 0x157b97bfe8fdc2477a2326a26cee20683bf25ca44a96f98ee5c233745f844a9b
+```
+
+Our relay runs this same comparison before it submits anything, and refuses if the code at the address is not that build.
+
+## What the registry records
+
+| For | It keeps | It never keeps |
+|---|---|---|
+| A board | Its chair, a random reference, its epoch, its nonce, its members | A name |
+| A key envelope | Its SHA-256, its size, its epoch, who it was for | The key |
+| A pack | Its SHA-256, its size, its epoch, the time | A name, a link, any content |
+
+## The signed changes
+
+Each takes a deadline and the chair's 4,627-byte ML-DSA-87 signature as its last two arguments.
+
+| Function | What it does |
+|---|---|
+| `createBoard` | Makes a board chaired by the signer, with its first key envelope. |
+| `addMember` | Adds a director, either to the current epoch or by starting a new one. |
+| `removeMember` | Removes a director and starts a new epoch in the same step. |
+| `rotateEpoch` | Starts a new epoch with the same members. |
+| `postDocument` | Records a pack's hash and size in the current epoch. |
+| `transferChair` | Hands the board to another member. |
+
+The exact bytes a chair signs are in [`docs/spec/actions.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/docs/spec/actions.md). The signature is checked by two QoreChain precompiles: `pqcKeyStatus` at `0x0000000000000000000000000000000000000a02` gives the chair's registered key, and `pqcVerify` at `0x0000000000000000000000000000000000000a01` verifies the signature against it.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Members of one board | 64 |
+| A key envelope | 110,000 bytes |
+| A pack, encrypted | 26,214,400 bytes (25 MiB) |
+| A signature's deadline | At most one hour after the latest block |
+
+## What a change costs
+
+Measured on testnet on 17 November 2026. On this site our relay pays these fees for you, within a daily budget.
+
+| Change | Gas used |
+|---|---|
+| `createBoard` | about 417,000 |
+| `addMember`, new epoch | about 359,000 |
+| `addMember`, current epoch | about 323,000 |
+| `removeMember` | about 292,000 |
+| `postDocument` | 310,000 to 327,000 |
+
+## Endpoints
+
+| Name | URL |
+|---|---|
+| Public EVM JSON-RPC | `https://evm-testnet.qore.host` |
+| Explorer | `https://explore.qore.network` (switch to Testnet) |
+
+The explorer finds a transaction by its native hash, and the registry's events carry EVM hashes, so this site shows each hash to copy and reads receipts straight from the endpoint above. [For judges](/docs/judges) lists one board's transactions with their explorer links.
+
+## Built with
+
+QoreChain SDK 0.14.0, QoreSeal 0.1.0 and qorechain-pqc 0.2.3, with viem, Foundry and OpenZeppelin Contracts 5.6.1.

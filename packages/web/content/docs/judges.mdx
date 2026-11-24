@@ -1,0 +1,69 @@
+---
+title: For judges
+description: The two-minute path through Ava, where each judging criterion shows, and real testnet transactions to click.
+---
+
+You need no wallet, no test tokens and no install. Your browser makes a throwaway identity and our sponsor account pays its first fees.
+
+## The two-minute path
+
+Steps 1 and 2 take about two minutes. Step 3 adds about ninety seconds of waiting for blocks.
+
+1. Open [Attack it](/proof). As the page loads, your browser runs four checks against the chain and shows each answer.
+   - A change with no ML-DSA-87 signature, sent from the chair's own address and from a stranger's. Both are refused with `BadSignature`.
+   - The demo board's newest real change, sent again byte for byte. Refused, with the registry's own reason.
+   - One real signature tried on five messages. The chain and your browser agree: valid once, and never again.
+   - The newest pack as we store it, hashed in your browser. It is the same hash the chain holds.
+2. Open [the demo board](/demo). Type any passphrase of ten characters or more and press **Make my identity and join**. Six chapters run on screen: your identity is made, funded, its two keys go on chain, you sign the chair's challenge, you are admitted, and a pack sealed to you opens on your device.
+3. Press **Leave the board**. Your browser signs your own removal, the board gets a new key, and the next pack is posted. Your browser then tries every key it holds on that pack and shows that none opens it.
+4. Open [your board room](/board) to run a board of your own: create it, add a director by address, post any file, remove the director, and read the ledger.
+
+Each change to a board takes about half a minute. The page says what it is doing while you wait.
+
+## Where each criterion shows
+
+| Criterion | Where to look |
+|---|---|
+| Works as described | The path above. Every number on every screen is read from the chain or made in your browser |
+| QoreChain tech usage, verified in the repo and on chain | The table below, and [Contracts and addresses](/docs/contracts) |
+| Post-quantum correctness and security | [Security](/docs/security) and [The Q-Day Drill](/docs/drill) |
+| Originality | The ledger in the board room admits what a removed director kept. On the demo you leave by your own signature and watch your own browser fail to open the next pack |
+| Clarity, UX and documentation | No wallet and no setup. These docs, and the repository's README, architecture and two byte-level specs |
+
+## The Encrypted Apps requirements
+
+| Requirement | Where it is |
+|---|---|
+| ML-KEM-1024 encryption | Each board key is sealed with QoreSeal to every member's ML-KEM-1024 key. The envelope's hash is on chain in an `EnvelopeGranted` event |
+| Registered recipient keys | The chair's browser reads each director's key from QoreChain's registry with `qor_getKEMKey`. Our server is never asked whose key is whose |
+| ML-DSA key binding | The registry accepts a change only when `pqcKeyStatus` returns a registered ML-DSA-87 key with possession proven for the chair, and `pqcVerify` accepts the signature against it |
+| Client-side encryption and decryption | Both happen in the browser. Our server and store hold ciphertext, named by its SHA-256 |
+| Key rotation and earlier data | Removing a director and changing the key are one transaction. The ledger works out who can open which pack from epochs, never from dates |
+
+## Real transactions
+
+One board's whole life, run from this web app on 23 November 2026. The explorer opens on mainnet: press **Testnet** in its top bar once and it remembers.
+
+| What happened | On the explorer |
+|---|---|
+| A chair created board 47 | [`FF70F18D...0CA741`](https://explore.qore.network/tx/FF70F18DD194D725506D01C53EC621DD307E8B145D509EB972229DE0C20CA741) |
+| Pack 1 posted, 132 bytes of ciphertext | [`933EBF4A...6B0F30`](https://explore.qore.network/tx/933EBF4AD4A33566EE7A61E4EDAD7070B95C1D0911E9018F47B9B841706B0F30) |
+| A director added, with the current key sealed to them | [`BC816397...8A4B58`](https://explore.qore.network/tx/BC8163972560B5E7466D334E5B7F925F4887A14EEEFB69CAF3DBA98E988A4B58) |
+| The director removed and the key changed, in one transaction | [`B6EE53F1...E6D3DD`](https://explore.qore.network/tx/B6EE53F17C9CA2C50A7D48A79CD9BBE390C6E9748FF762A5872C3B5925E6D3DD) |
+| Pack 4 posted after the removal, shut to them | [`CDFF5FF4...6BB179`](https://explore.qore.network/tx/CDFF5FF44807FEDFC8E87BF1F89C05414433B79A8C1CAEDE243D9B17076BB179) |
+| Our Q-Day Drill proof transaction | [`85C35B4A...023773`](https://explore.qore.network/tx/85C35B4A0E804D5385719D795EB383E5D0EBB974FD1A49B18A6AE8B112023773) |
+
+## From a terminal
+
+With no account and no secret. The attack suite uses the shared library and the server package, so those two are installed first:
+
+```bash
+git clone https://github.com/ramakrishnanhulk20/ava
+cd ava/packages/core && npm install
+cd ../server && npm install
+cd ../../security && npm install
+npx tsx run.ts --offline
+# 4 of 4 offline attacks held.
+```
+
+The live attack suite, its last run and the contract's own prove script are described in [Getting started](/docs/getting-started) and [Security](/docs/security).

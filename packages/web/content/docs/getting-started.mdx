@@ -1,0 +1,78 @@
+---
+title: Getting started
+description: Try the demo in three minutes, run a board of your own, or run the code.
+---
+
+Everything here is on the QoreChain testnet. Nothing costs real money, and you need no wallet: your browser makes your identity and our sponsor account pays its first fees.
+
+## Try the demo board
+
+1. Open [the demo](/demo).
+2. Choose a passphrase of ten characters or more and press **Make my identity and join**.
+3. Watch six short chapters: your identity is made, funded, its two keys go on chain, you sign the chair's challenge, you are admitted, and a pack sealed to you opens on your device.
+4. Under the pack, press **Leave the board**. Your browser signs your own removal, the board gets a new key, and the next pack is posted. Your browser then tries every key it holds on that pack and shows that none opens it.
+
+It takes about three minutes. Each address is admitted to the demo board once; **Start over as a new visitor** makes a fresh one.
+
+## Run a board of your own
+
+1. Open [your board room](/board) and make an identity, or open the one this browser already holds.
+2. Press **Create a board**. Your browser makes the board's first key, seals it to you, signs the create, and our relay submits it. About half a minute.
+3. Ask each director to open the board room on their own device. It shows their address. They send it to you; it is not a secret.
+4. Open your board, paste a director's address under **Add a director**, and choose what they may read:
+   - Choose **Only packs from now on** to give the board a new key sealed to everyone and to them.
+   - Choose **This epoch's packs too** to seal the current key to them as well.
+5. Press **Post a pack** and choose any file up to 25 MB. It is encrypted in your browser; only the ciphertext is uploaded.
+6. To take someone off the board, press **Remove** beside their address. Post the next pack afterwards and it is shut to them.
+7. Press **Check every key envelope** to download each envelope the board has recorded and count its entries against the people it should name, so an extra reader cannot hide.
+
+A director opens the same board room, sees every board that names their address, and opens the packs their keys allow.
+
+### Keep your recovery words
+
+Your identity lives in the browser that made it. **Show my recovery words** in the board room shows the 24 words; write them down. On another device, or after clearing this one, choose **I have recovery words** to bring the same identity back. Nobody, us included, can restore it without them.
+
+## Run the code
+
+The repository is four packages that are installed one by one, in this order, because the later ones use the earlier ones. Node.js 22.13 or newer.
+
+```bash
+git clone https://github.com/ramakrishnanhulk20/ava
+cd ava/packages/core && npm install && npm test
+cd ../server && npm install && npm test
+cd ../web && npm install && npm test
+```
+
+The contract tests need [Foundry](https://getfoundry.sh):
+
+```bash
+cd ../contracts && npm install
+npm run install:forge-std && npm run install:oz
+forge test
+```
+
+To run the site locally, copy `packages/web/.env.example` to `packages/web/.env.local`, fill in the values it describes, and start it:
+
+```bash
+cd ../web && npm run dev
+```
+
+The page works for reading the chain with only the public values set. Joining the demo board, creating a board and posting packs also need the server's own accounts and stores, which the example file lists by name.
+
+## Prove it against the live chain
+
+With no account and no secret, once `packages/core` and `packages/server` are installed as above:
+
+```bash
+cd security && npm install
+npx tsx run.ts --offline
+# 4 of 4 offline attacks held.
+```
+
+With a funded testnet account in `packages/contracts/.env`:
+
+```bash
+cd packages/contracts && npm run prove:registry
+```
+
+It walks a real board through its life on testnet and attacks it at each step. Every attack must be refused. The latest saved run is in `packages/contracts/deployments/`, and the wider attack suite with its live results is in [`security/`](https://github.com/ramakrishnanhulk20/ava/tree/main/security).

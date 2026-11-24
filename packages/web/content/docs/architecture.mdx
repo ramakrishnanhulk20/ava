@@ -1,0 +1,55 @@
+---
+title: Architecture and failure cases
+description: The four pieces, how one signed change travels, and what happens when each part fails.
+---
+
+## The pieces
+
+| Piece | What it does | Sees a pack's content? |
+|---|---|---|
+| **The web app**, in your browser | Holds your keys, seals and opens board keys, encrypts and decrypts packs, signs a chair's changes, draws the ledger | Yes, for boards you sit on |
+| **The server handlers**, on the site's hosting | Relay signed changes, fund a new identity once, store ciphertext, pass a few chain reads along | No |
+| **The stores**, two managed services | A counter store for limits and locks, and a blob store holding ciphertext under its SHA-256 | No |
+| **BoardRegistry**, on the QoreChain testnet | The one record of every board: its chair, members, epoch, envelopes and packs. Checks every signature itself | No |
+
+The browser reads the chain directly, through QoreChain's public EVM endpoint. Our server is never on the path that tells a chair who is on a board or which key belongs to a director.
+
+<SystemDiagram />
+
+## How one change travels
+
+Take a chair removing a director.
+
+1. Read. The browser reads the board's record, its nonce and its member list at one block.
+2. Seal. It makes a new board key, reads each remaining member's ML-KEM-1024 key from the chain, and seals the new key to them with QoreSeal. The envelope is uploaded; its SHA-256 is computed in the browser.
+3. Sign. It builds the 256-byte message for this board, this action, this nonce and a deadline a few minutes ahead, and signs it with the chair's ML-DSA-87 key.
+4. Relay. Our relay simulates the exact transaction first. If the registry would refuse it, the relay refuses it too and spends nothing. Otherwise it submits the transaction and pays the fee.
+5. Check. The registry builds the same 256 bytes, reads the chair's registered key through `pqcKeyStatus`, and has `pqcVerify` check the signature. Then it removes the member, moves the epoch and records the new envelope, all in one transaction.
+6. Confirm. The browser treats the relay's answer as a claim. It reads the transaction's receipt from the chain and looks for the registry's own event for this board and this nonce. Only then does the screen say it is done.
+
+## What happens when something fails
+
+| What fails | What happens |
+|---|---|
+| Our relay is offline or refuses | Nothing changes. Every board stays on chain, and a chair's signed change can be submitted by any funded account, because the sender gains nothing |
+| The relay's daily budget runs out | It refuses until the next day (UTC) and says so. Boards and packs stay readable |
+| A reply from the relay is lost | The browser never relied on it. It looks for the registry's own event. A signed change is good for one nonce, so it lands at most once |
+| Two changes are made to one board at the same moment | The first to land moves the board's nonce. The second no longer matches and is refused, instead of sealing a key from a stale member list |
+| The chain cannot be reached | The page says so. A ledger that cannot be read in full is shown as incomplete, never as a shorter list |
+| The events and the registry's member list disagree | No ledger is drawn. The page says the history is incomplete |
+| Our store loses a pack's ciphertext | Opening fails and says the stored bytes are missing. The chain still holds the hash, so any copy kept elsewhere can be checked against it |
+| Our store serves other bytes | The size is checked, then the SHA-256, before any key is touched. A mismatch stops there |
+| A director has no ML-KEM-1024 key on chain | The chair's browser stops before sealing and says whose key is missing. Nobody is added with a key from anywhere else |
+| A director replaced their key after an envelope was sealed | The envelope check shows that envelope as unverified, never as clean |
+| A wrong passphrase | The identity stays locked. There is no fallback and no reset |
+| A lost device | The identity comes back from its 24 recovery words on another device. Without the words it is gone, and we cannot restore it |
+| The chair's ML-DSA-87 key is replaced or removed on chain | Every change to that board is refused from then on. A board nobody can prove authority over changes for nobody, and its packs stay readable to their readers |
+| The testnet is reset | Everything on it is gone, Ava's boards included. No signature outlives it, because none is valid for more than an hour |
+
+## For developers
+
+- The shared library, `packages/core`, builds the exact signed bytes, decodes addresses one way, seals and opens board keys and encrypts packs. Everything else uses it, and it works on its own. The repository's README has a worked example.
+- The server handlers, `packages/server`, are plain request-to-response functions. The web app mounts them under `/api`.
+- Two specs give the bytes: [`docs/spec/actions.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/docs/spec/actions.md) for a signed change and [`docs/spec/pack.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/docs/spec/pack.md) for an encrypted pack.
+- A `pqcVerify` test double for Foundry is in `packages/contracts/test/helpers/PqcTestKit.sol`. Copy it and the three mocks beside it to test your own contract against QoreChain's two precompiles on a local chain.
+- The full description, with every endpoint's request and response, is [`ARCHITECTURE.md`](https://github.com/ramakrishnanhulk20/ava/blob/main/ARCHITECTURE.md).

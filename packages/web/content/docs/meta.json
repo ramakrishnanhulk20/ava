@@ -1,0 +1,17 @@
+{
+  "title": "Docs",
+  "pages": [
+    "index",
+    "judges",
+    "how-it-works",
+    "getting-started",
+    "---Developers---",
+    "architecture",
+    "contracts",
+    "---Security---",
+    "security",
+    "drill",
+    "---Help---",
+    "faq"
+  ]
+}
