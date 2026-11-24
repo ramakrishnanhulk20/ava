@@ -1,0 +1,787 @@
+@import "tailwindcss";
+/* The docs under /docs are drawn by Fumadocs; its colours are mapped to this site's own further down. */
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+
+@theme inline {
+  --color-paper-top: var(--paper-top);
+  --color-paper-mid: var(--paper-mid);
+  --color-paper-bottom: var(--paper-bottom);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-rule: var(--rule);
+  --color-sheet: var(--sheet);
+  --color-sheet-1: var(--sheet-1);
+  --color-sheet-2: var(--sheet-2);
+  --color-wax: var(--wax);
+  --color-wax-deep: var(--wax-deep);
+  --color-deep-ink: var(--deep-ink);
+  --color-deep-ink-deep: var(--deep-ink-deep);
+  --color-accent: var(--accent);
+  --color-accent-deep: var(--accent-deep);
+  --color-accent-on-ink: var(--accent-on-ink);
+  --color-live: var(--live);
+  --color-on-ink: var(--on-ink);
+}
+
+:root {
+  --paper-top: #dad8e8;
+  --paper-mid: #e7e1e9;
+  --paper-bottom: #f2e4dc;
+  --ink: #16141c;
+  --ink-soft: #4a4656;
+  --rule: rgba(22, 20, 28, 0.14);
+  --sheet: #fbf9f6;
+  --sheet-1: #f4f1f6;
+  --sheet-2: #ece8f1;
+  --wax: #a12a2f;
+  --wax-deep: #6e1519;
+  --deep-ink: #22306b;
+  --deep-ink-deep: #121b45;
+  --accent: var(--wax);
+  --accent-deep: var(--wax-deep);
+  --accent-on-ink: #e0646a;
+  --live: #2f7d78;
+  --on-ink: #f7f4f2;
+
+  --seal-shadow: rgba(90, 10, 15, 0.45);
+
+  --font-display: var(--face-fraunces), "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --display-weight: 300;
+  --display-axes: "opsz" 144, "SOFT" 30, "WONK" 1;
+  --font-body: var(--face-hanken), "Segoe UI", system-ui, sans-serif;
+  --font-mono: var(--face-plex), ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --hero-p: 0;
+  --pack-rest: -7deg;
+  --pack-tilt-x: 0px;
+  --pack-tilt-y: 0px;
+}
+
+/* A steep tilt would push the pack corners past the screen edge on narrow screens. */
+@media (max-width: 1023px) {
+  :root {
+    --pack-rest: -4deg;
+  }
+}
+
+[data-accent="wax"] {
+  --accent: var(--wax);
+  --accent-deep: var(--wax-deep);
+  --accent-on-ink: #e0646a;
+  --seal-shadow: rgba(90, 10, 15, 0.45);
+}
+
+[data-accent="ink"] {
+  --accent: var(--deep-ink);
+  --accent-deep: var(--deep-ink-deep);
+  --accent-on-ink: #8fa2f0;
+  --seal-shadow: rgba(10, 15, 50, 0.45);
+}
+
+[data-serif="fraunces"] {
+  --font-display: var(--face-fraunces), "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --display-weight: 300;
+  --display-axes: "opsz" 144, "SOFT" 30, "WONK" 1;
+}
+
+[data-serif="instrument"] {
+  --font-display: var(--face-instrument), "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --display-weight: 400;
+  --display-axes: normal;
+}
+
+[data-serif="newsreader"] {
+  --font-display: var(--face-newsreader), "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --display-weight: 300;
+  --display-axes: "opsz" 72;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100svh;
+  background: linear-gradient(170deg, var(--paper-top) 0%, var(--paper-mid) 46%, var(--paper-bottom) 100%) fixed;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--on-ink);
+}
+
+a:focus-visible,
+input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* The wax ring disappears on the ink band and footer, so they use the lighter accent. */
+[data-ink-surface] a:focus-visible,
+[data-ink-surface] button:focus-visible {
+  outline-color: var(--accent-on-ink);
+}
+
+/* The docs take this site's paper, ink and wax: Fumadocs draws everything from these variables. */
+@theme inline {
+  --color-fd-background: var(--paper-mid);
+  --color-fd-foreground: var(--ink);
+  --color-fd-muted: rgba(22, 20, 28, 0.05);
+  --color-fd-muted-foreground: var(--ink-soft);
+  --color-fd-popover: var(--sheet);
+  --color-fd-popover-foreground: var(--ink);
+  --color-fd-card: var(--sheet);
+  --color-fd-card-foreground: var(--ink);
+  --color-fd-border: var(--rule);
+  --color-fd-primary: var(--ink);
+  --color-fd-primary-foreground: var(--on-ink);
+  --color-fd-secondary: rgba(22, 20, 28, 0.06);
+  --color-fd-secondary-foreground: var(--ink);
+  --color-fd-accent: rgba(22, 20, 28, 0.07);
+  --color-fd-accent-foreground: var(--ink);
+  --color-fd-ring: var(--wax);
+  --font-mono: var(--face-plex), ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+@layer base {
+  /* Fumadocs gives every border its own default colour. Outside the docs a border keeps the colour of its text, as it always has here. */
+  html:not(:has(.docs-root)) *,
+  html:not(:has(.docs-root)) ::before,
+  html:not(:has(.docs-root)) ::after {
+    border-color: currentColor;
+  }
+}
+
+@layer components {
+  /* The docs sidebar hides its native scrollbar with this class. The library would write the rule as an inline
+     <style> element, which the page policy refuses, so app/docs/layout.tsx switches that off and the rule is here. */
+  .base-ui-disable-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .base-ui-disable-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* The docs' page title is set like every other title on the site; the body keeps the reading face. */
+  .docs-root h1 {
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: var(--display-weight);
+    font-variation-settings: var(--display-axes);
+    font-size: clamp(2.5rem, 4vw, 3.5rem);
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }
+
+  .docs-root .prose a {
+    text-decoration-color: var(--wax);
+    text-underline-offset: 3px;
+  }
+
+  .docs-root .prose :where(code):not(:where(pre *)) {
+    font-size: 0.9em;
+  }
+}
+
+@layer components {
+  .mono {
+    font-family: var(--font-mono);
+    font-weight: 400;
+    text-transform: uppercase;
+  }
+
+  .display {
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: var(--display-weight);
+    font-variation-settings: var(--display-axes);
+  }
+
+  .headline {
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: var(--display-weight);
+    font-variation-settings: var(--display-axes);
+    font-size: clamp(3rem, 6.4vw, 7rem);
+    line-height: 0.94;
+    letter-spacing: -0.025em;
+    color: var(--ink);
+    max-width: 11.5em;
+    text-wrap: balance;
+    animation: settle 900ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .link-draw {
+    position: relative;
+    display: inline-block;
+    transition: color 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .link-draw::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -3px;
+    height: 1px;
+    background: currentColor;
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .link-draw:hover,
+  .link-draw:focus-visible {
+    color: var(--ink);
+  }
+
+  .link-draw:hover::after {
+    transform: scaleX(1);
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    height: 52px;
+    padding-inline: 22px;
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--on-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    transition:
+      background-color 220ms ease-out,
+      transform 120ms ease-out;
+  }
+
+  .btn-primary:hover {
+    background: var(--accent);
+  }
+
+  .btn-primary:active {
+    transform: scale(0.98);
+  }
+
+  .btn-primary .arrow {
+    display: inline-block;
+    transition: transform 220ms ease-out;
+  }
+
+  /* A disabled button keeps its place and says it cannot be pressed; the accent stays for buttons that can. */
+  .btn-primary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-primary:disabled:hover {
+    background: var(--ink);
+  }
+
+  /* The same button on the ink band: light on dark, with the lighter accent on hover. */
+  .btn-on-ink {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 52px;
+    padding: 10px 22px;
+    border-radius: 8px;
+    background: var(--on-ink);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    text-align: left;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    transition:
+      background-color 220ms ease-out,
+      transform 120ms ease-out;
+  }
+
+  .btn-on-ink:hover {
+    background: var(--accent-on-ink);
+  }
+
+  .btn-on-ink:active {
+    transform: scale(0.98);
+  }
+
+  .btn-on-ink:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .btn-on-ink:disabled:hover {
+    background: var(--on-ink);
+  }
+
+  /* A band headline that changes settles the way the hero's does. */
+  .band-settle {
+    animation: settle 900ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .btn-primary:disabled:hover .arrow {
+    transform: none;
+  }
+
+  .field {
+    width: 100%;
+    height: 52px;
+    padding: 0 76px 0 16px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    background: rgba(251, 249, 246, 0.7);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    transition: border-color 200ms ease-out;
+  }
+
+  .field:hover,
+  .field:focus-visible {
+    border-color: var(--ink);
+  }
+
+  .btn-primary:hover .arrow {
+    transform: translateX(4px);
+  }
+
+  .trust-item + .trust-item::before {
+    content: "";
+    display: inline-block;
+    width: 1px;
+    height: 12px;
+    margin-right: 16px;
+    vertical-align: -1px;
+    background: var(--rule);
+  }
+
+  .live-dot {
+    position: relative;
+    display: inline-block;
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: color-mix(in srgb, var(--ink-soft) 50%, transparent);
+  }
+
+  .live-dot[data-live="true"] {
+    background: var(--live);
+  }
+
+  .live-dot[data-live="true"]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background: var(--live);
+    animation: live-ring 2.4s ease-out infinite;
+  }
+
+  .pack-wrap {
+    container-type: inline-size;
+  }
+
+  .pack-design {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* On wide screens the pack is drawn at 400px and scaled down to the room the column leaves it. */
+  @media (min-width: 1024px) {
+    .pack-design {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 400px;
+      height: calc(400px * 580 / 460);
+      transform: scale(tan(atan2(100cqw, 400px)));
+      transform-origin: 0 0;
+    }
+  }
+
+  .pack-scroll {
+    transform: rotate(calc(var(--hero-p) * -1 * var(--pack-rest))) translateY(calc(var(--hero-p) * -40px))
+      scale(calc(1 - var(--hero-p) * 0.06));
+  }
+
+  .pack-pose {
+    perspective: 1400px;
+    rotate: var(--pack-rest);
+    translate: var(--pack-tilt-x) var(--pack-tilt-y);
+    will-change: transform;
+  }
+
+  .pack-float {
+    animation: float 7s ease-in-out infinite;
+  }
+
+  .pack-enter {
+    animation: pack-enter 1100ms cubic-bezier(0.16, 1, 0.3, 1) 150ms both;
+  }
+
+  .seal-press {
+    animation: seal-press 520ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  }
+
+  .seal-press-first {
+    animation-delay: var(--press-delay, 0s);
+  }
+
+  .seal-ripple {
+    position: absolute;
+    inset: 4%;
+    border: 1.5px solid var(--accent);
+    border-radius: 9999px;
+    opacity: 0;
+    pointer-events: none;
+    animation: seal-ripple 700ms ease-out forwards;
+  }
+
+  .seal-ripple-intro {
+    animation-delay: calc(var(--press-delay, 0s) + 520ms);
+  }
+
+  .pack-sheet {
+    position: absolute;
+    inset: 0;
+    border-radius: 6px;
+    border: 1px solid rgba(22, 20, 28, 0.08);
+    box-shadow:
+      0 30px 60px -20px rgba(40, 30, 60, 0.35),
+      0 8px 18px -8px rgba(40, 30, 60, 0.2);
+  }
+
+  .seal {
+    position: relative;
+    display: block;
+  }
+
+  .paper {
+    background: var(--sheet);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    box-shadow:
+      0 30px 60px -20px rgba(40, 30, 60, 0.35),
+      0 8px 18px -8px rgba(40, 30, 60, 0.2);
+  }
+
+  /* The slip and the ledger card show and hide through data-on, so they need no script to sit in their end state. */
+  .slip {
+    opacity: 0;
+    transform: translateY(24px) rotate(2deg);
+    transition:
+      opacity 300ms ease-in,
+      transform 300ms ease-in;
+  }
+
+  .slip[data-on="true"] {
+    opacity: 1;
+    transform: rotate(2deg);
+    transition:
+      opacity 500ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 500ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .slip-tick {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+  }
+
+  .slip[data-on="true"] .slip-tick {
+    stroke-dashoffset: 0;
+    transition: stroke-dashoffset 360ms ease-out 500ms;
+  }
+
+  .ledger {
+    opacity: 0;
+    transform: translateX(12px) rotate(-1.5deg);
+    transition:
+      opacity 300ms ease-out,
+      transform 300ms ease-out;
+  }
+
+  .ledger[data-on="true"] {
+    opacity: 1;
+    transform: rotate(-1.5deg);
+    transition:
+      opacity 500ms ease-out,
+      transform 500ms ease-out;
+  }
+
+  .beat {
+    transition: opacity 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .beat-dim {
+    opacity: 0.32;
+  }
+
+  .how-pack {
+    rotate: -4deg;
+  }
+
+  .drill-card {
+    rotate: 1.5deg;
+  }
+
+  /* The demo stage is drawn at 524 by 640 and scaled down to the width its column gives it. */
+  .demo-stage {
+    position: relative;
+    width: 100%;
+    max-width: 524px;
+    margin-inline: auto;
+    aspect-ratio: 524 / 640;
+    container-type: inline-size;
+  }
+
+  .demo-stage-design {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 524px;
+    height: 640px;
+    transform: scale(tan(atan2(100cqw, 524px)));
+    transform-origin: 0 0;
+  }
+
+  .keycard {
+    opacity: 0;
+    transform: translateX(-24px) rotate(-3deg);
+    transition:
+      opacity 600ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 600ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .keycard[data-on="true"] {
+    opacity: 1;
+    transform: rotate(-3deg);
+  }
+
+  .demo-fade {
+    opacity: 0;
+    transition: opacity 400ms ease-out;
+  }
+
+  .demo-fade[data-on="true"] {
+    opacity: 1;
+  }
+
+  .demo-sheet {
+    opacity: 0;
+    transform: translate(40px, -20px) rotate(2deg);
+    transition:
+      opacity 700ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 700ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .demo-sheet[data-on="true"] {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* A hairline track with a short ink segment sliding along it while a chapter runs. */
+  .demo-track {
+    position: relative;
+    height: 1px;
+    overflow: hidden;
+    background: var(--rule);
+  }
+
+  .demo-track::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: 30%;
+    background: var(--ink);
+    animation: demo-slide 1.4s linear infinite;
+  }
+
+  @media (max-width: 1023px) {
+    .drill-card {
+      rotate: 0deg;
+    }
+  }
+
+  /* The stage is drawn at 704 by 640 and scaled down when its column is narrower, with 56px of slack into the empty column beside it. */
+  .how-stage {
+    position: relative;
+    height: 580px;
+    container-type: inline-size;
+  }
+
+  .how-stage-design {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 704px;
+    height: 640px;
+    transform: scale(min(1, tan(atan2(100cqw + 56px, 704px))));
+    transform-origin: 0 290px;
+  }
+
+  /* On narrow screens each beat carries its own still, drawn at 492px wide and scaled to the width it is given. */
+  .how-still {
+    position: relative;
+    width: min(360px, 86vw);
+    margin: 32px auto 0;
+    container-type: inline-size;
+  }
+
+  .how-still-design {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 492px;
+    transform: scale(tan(atan2(100cqw, 492px)));
+    transform-origin: 0 0;
+  }
+}
+
+@keyframes settle {
+  from {
+    letter-spacing: 0.01em;
+  }
+  to {
+    letter-spacing: -0.025em;
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes pack-enter {
+  from {
+    opacity: 0;
+    transform: translateX(60px) rotate(5deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes seal-press {
+  from {
+    opacity: 0;
+    transform: scale(1.35) rotate(-14deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes seal-ripple {
+  from {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.6);
+  }
+}
+
+@keyframes demo-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(333%);
+  }
+}
+
+@keyframes live-ring {
+  from {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  to {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .headline,
+  .pack-float,
+  .pack-enter,
+  .seal-press,
+  .seal-ripple,
+  .band-settle,
+  .live-dot::after {
+    animation: none;
+  }
+
+  .live-dot::after,
+  .seal-ripple {
+    display: none;
+  }
+
+  .proof-explain,
+  .keycard,
+  .demo-fade,
+  .demo-sheet {
+    transition: none;
+  }
+
+  .demo-track::after {
+    width: 100%;
+    animation: none;
+  }
+
+  .link-draw,
+  .link-draw::after,
+  .btn-primary,
+  .btn-primary .arrow,
+  .btn-on-ink,
+  .slip,
+  .slip[data-on="true"],
+  .slip[data-on="true"] .slip-tick,
+  .ledger,
+  .ledger[data-on="true"],
+  .beat {
+    transition: none;
+  }
+}
+
+/* Reduced motion shows the table at rest. The rows and ticks start hidden inline, so the stylesheet has to win. */
+@media (prefers-reduced-motion: reduce) {
+  .proof-row {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .proof-tick {
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+}
+
+@media (max-width: 639px) {
+  .trust-item + .trust-item::before {
+    display: none;
+  }
+}
