@@ -16,6 +16,7 @@ reference/
 .env
 .env.*
 !.env.example
+.secrets/
 
 # Build output and dependencies
 node_modules/
