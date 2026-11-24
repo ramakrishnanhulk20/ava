@@ -6,6 +6,7 @@ import {
   CHALLENGE_MESSAGE_LENGTH,
   actionMessage,
   challengeMessage,
+  leaveMessage,
   paramsAdd,
   paramsCreate,
   paramsPost,
@@ -139,6 +140,32 @@ export function signChallenge(
 ): { message: Uint8Array; signature: Uint8Array } {
   requireWindow(p.expiry, p.latestBlockTimestamp, "expiry");
   const message = challengeMessage({ registry: p.registry, boardId: p.boardId, guest: p.guest, botNonce: p.botNonce, expiry: p.expiry });
+  return { message, signature: mldsaSign(mldsaSecretKey, message) };
+}
+
+/**
+ * Signs a guest's request to leave the demo board from its typed fields (threat model C2, C45, C47).
+ * Builds the 224 bytes with leaveMessage and signs those; a `message` field on `p` is ignored. This
+ * is the only signer for a leave: signAction refuses those bytes, so a page that signs raw bytes a
+ * server supplied can never be made to sign a removal.
+ *
+ * Covers an expiry in the past or more than MAX_DEADLINE_AHEAD (one hour) past the latest block.
+ * Does not cover a wrong `latestBlockTimestamp` (read it from the chain), and does not check that
+ * the guest meant to leave: sign only after a control that says what it does.
+ *
+ * @param p.expiry Unix seconds, more than `latestBlockTimestamp` and at most MAX_DEADLINE_AHEAD past it.
+ * @param p.latestBlockTimestamp The timestamp of the chain's latest block, in Unix seconds.
+ * @returns The signed leave request and the 4,627-byte signature.
+ * @throws ActionError for an expiry outside that window, board id 0, a zero botNonce, or a value
+ *   outside its type. AddressError for a bad registry or guest. Error when the secret key is not a
+ *   4,896-byte ML-DSA-87 key.
+ */
+export function signLeave(
+  mldsaSecretKey: Uint8Array,
+  p: { registry: string; boardId: Uint; guest: string; botNonce: Bytes32; expiry: Uint; latestBlockTimestamp: Uint },
+): { message: Uint8Array; signature: Uint8Array } {
+  requireWindow(p.expiry, p.latestBlockTimestamp, "expiry");
+  const message = leaveMessage({ registry: p.registry, boardId: p.boardId, guest: p.guest, botNonce: p.botNonce, expiry: p.expiry });
   return { message, signature: mldsaSign(mldsaSecretKey, message) };
 }
 

@@ -8,6 +8,7 @@ import { bytesToHex, type Hex } from "viem";
 import {
   actionMessage,
   challengeMessage,
+  leaveMessage,
   paramsAdd,
   paramsCreate,
   paramsPost,
@@ -15,7 +16,7 @@ import {
   paramsRotate,
   paramsTransfer,
 } from "../src/actions.ts";
-import { Action, BOARD_TAG, CHALLENGE_TAG, EVM_CHAIN_ID, Mode } from "../src/constants.ts";
+import { Action, BOARD_TAG, CHALLENGE_TAG, EVM_CHAIN_ID, LEAVE_TAG, Mode } from "../src/constants.ts";
 
 const OUT = resolve(dirname(fileURLToPath(import.meta.url)), "../test-vectors/actions.json");
 
@@ -102,6 +103,16 @@ const challenge = {
   message: bytesToHex(challengeMessage({ registry: REGISTRY, boardId: BOARD_ID, guest: GUEST, botNonce: BOT_NONCE, expiry: DEADLINE })),
 };
 
+// The leave request has the challenge's shape under its own tag, so one check covers both and proves the tags differ.
+const leave = {
+  registry: REGISTRY,
+  boardId: BOARD_ID.toString(),
+  guest: GUEST,
+  botNonce: BOT_NONCE,
+  expiry: DEADLINE.toString(),
+  message: bytesToHex(leaveMessage({ registry: REGISTRY, boardId: BOARD_ID, guest: GUEST, botNonce: BOT_NONCE, expiry: DEADLINE })),
+};
+
 const file = {
   spec: "docs/spec/actions.md",
   note: "uint64 and uint256 values are decimal strings. message = abi.encode(domainTag, chainId, registry, action, boardId, paramsHash, nonce, deadline).",
@@ -109,12 +120,15 @@ const file = {
   registry: REGISTRY,
   domainTag: BOARD_TAG,
   challengeTag: CHALLENGE_TAG,
+  leaveTag: LEAVE_TAG,
   vectors,
   challenge,
+  leave,
 };
 
 mkdirSync(dirname(OUT), { recursive: true });
 writeFileSync(OUT, `${JSON.stringify(file, null, 2)}\n`, "utf8");
-console.log(`Wrote ${vectors.length} action vectors and the challenge to ${OUT}`);
+console.log(`Wrote ${vectors.length} action vectors, the challenge and the leave request to ${OUT}`);
 for (const v of vectors) console.log(`  ${v.name.padEnd(8)} paramsHash ${v.paramsHash}  message ${(v.message.length - 2) / 2} bytes`);
 console.log(`  CHALLENGE message ${(challenge.message.length - 2) / 2} bytes`);
+console.log(`  LEAVE     message ${(leave.message.length - 2) / 2} bytes`);

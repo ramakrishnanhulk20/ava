@@ -1,12 +1,13 @@
 import { bytesToHex, encodeAbiParameters, hexToBytes, keccak256, type Address, type Hex } from "viem";
 import { accountBytes, accountBytesStrict, toHex } from "./address.ts";
-import { Action, BOARD_TAG, CHALLENGE_TAG, EVM_CHAIN_ID, MAX_CIPHER_SIZE, MAX_DEADLINE_AHEAD, MAX_ENVELOPE_SIZE, Mode } from "./constants.ts";
+import { Action, BOARD_TAG, CHALLENGE_TAG, EVM_CHAIN_ID, LEAVE_TAG, MAX_CIPHER_SIZE, MAX_DEADLINE_AHEAD, MAX_ENVELOPE_SIZE, Mode } from "./constants.ts";
 import { toBytes32, toUint, type Bytes32, type Uint } from "./values.ts";
 
 /** Eight 32-byte words. */
 export const ACTION_MESSAGE_LENGTH = 256;
 /** Seven 32-byte words. */
 export const CHALLENGE_MESSAGE_LENGTH = 224;
+export const LEAVE_MESSAGE_LENGTH = 224;
 
 /** An input that cannot go into a signed action or challenge. */
 export class ActionError extends Error {
@@ -200,6 +201,29 @@ export function challengeMessage(p: { registry: string; boardId: Uint; guest: st
     ),
   );
   if (message.length !== CHALLENGE_MESSAGE_LENGTH || message[0] !== 0x00) throw new ActionError("The challenge did not come out as 224 bytes starting 0x00.");
+  return message;
+}
+
+/**
+ * The bytes a guest signs to leave the demo board (docs/spec/actions.md, threat model C47):
+ * `abi.encode(LEAVE_TAG, 9800, registry, boardId, guest, botNonce, expiry)`, 224 bytes, first bytes
+ * 0xe6 0x6f. The same seven words as the challenge under another tag, so the two can never stand in
+ * for each other.
+ *
+ * @throws ActionError for board id 0, a zero botNonce or expiry, or a value outside its type.
+ */
+export function leaveMessage(p: { registry: string; boardId: Uint; guest: string; botNonce: Bytes32; expiry: Uint }): Uint8Array {
+  const boardId = uint(p.boardId, 256, "boardId");
+  if (boardId === 0n) throw new ActionError("A leave request names an existing board.");
+  const expiry = uint(p.expiry, 64, "expiry");
+  if (expiry === 0n) throw new ActionError("expiry must not be zero.");
+  const message = hexToBytes(
+    encodeAbiParameters(
+      [{ type: "bytes32" }, { type: "uint256" }, { type: "address" }, { type: "uint256" }, { type: "address" }, { type: "bytes32" }, { type: "uint64" }],
+      [LEAVE_TAG, BigInt(EVM_CHAIN_ID), account(p.registry, "registry"), boardId, account(p.guest, "guest"), bytes32(p.botNonce, "botNonce"), expiry],
+    ),
+  );
+  if (message.length !== LEAVE_MESSAGE_LENGTH || message[0] !== 0xe6) throw new ActionError("The leave request did not come out as 224 bytes starting 0xe6.");
   return message;
 }
 

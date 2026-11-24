@@ -3,6 +3,7 @@ export {
   BOARD_TAG,
   CHAIN_ID,
   CHALLENGE_TAG,
+  LEAVE_TAG,
   EVM_CHAIN_ID,
   EVM_RPC,
   MAX_CIPHER_SIZE,
@@ -21,8 +22,10 @@ export {
   ACTION_MESSAGE_LENGTH,
   ActionError,
   CHALLENGE_MESSAGE_LENGTH,
+  LEAVE_MESSAGE_LENGTH,
   actionMessage,
   challengeMessage,
+  leaveMessage,
   deadlineFrom,
   paramsAdd,
   paramsCreate,
@@ -33,7 +36,7 @@ export {
   type BoardActionInput,
 } from "./actions.ts";
 export { canonicalPhrase, generateMnemonic, identityFromMnemonic, type Identity } from "./identity.ts";
-export { signAction, signBoardAction, signChallenge, verifyAction } from "./sign.ts";
+export { signAction, signBoardAction, signChallenge, signLeave, verifyAction } from "./sign.ts";
 export { HashMismatch, assertHash, sameHash, sha256 } from "./hash.ts";
 export {
   DocumentError,

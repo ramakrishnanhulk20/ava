@@ -7,6 +7,7 @@ import {
   actionMessage,
   challengeMessage,
   deadlineFrom,
+  leaveMessage,
   paramsAdd,
   paramsCreate,
   paramsPost,
@@ -15,7 +16,7 @@ import {
   paramsTransfer,
 } from "../src/actions.ts";
 import { AddressError, toQor1 } from "../src/address.ts";
-import { Action, BOARD_TAG, CHALLENGE_TAG, MAX_DEADLINE_AHEAD, Mode } from "../src/constants.ts";
+import { Action, BOARD_TAG, CHALLENGE_TAG, LEAVE_TAG, MAX_DEADLINE_AHEAD, Mode } from "../src/constants.ts";
 
 // abi.encode of static types is a run of 32-byte big-endian words. Built by hand here, apart from viem.
 function word(value: bigint | number | Hex): Uint8Array {
@@ -194,5 +195,40 @@ describe("deadlineFrom", () => {
     expect(() => deadlineFrom(1_795_000_000n, MAX_DEADLINE_AHEAD + 1)).toThrow(ActionError);
     expect(() => deadlineFrom(1_795_000_000n, 0)).toThrow(ActionError);
     expect(() => deadlineFrom(-1, 600)).toThrow(ActionError);
+  });
+});
+
+describe("leaveMessage", () => {
+  const p = { registry: REGISTRY, boardId: 7n, guest: MEMBER, botNonce: `0x${"b1".repeat(32)}` as Hex, expiry: 1_795_000_000n };
+
+  it("is the seven words of the spec under its own tag, first bytes 0xe6 0x6f", () => {
+    expect(LEAVE_TAG).toBe(keccak256(stringToBytes("ava.leave.v1")));
+    const message = leaveMessage(p);
+    const expected = concat([word(LEAVE_TAG), word(9800), word(REGISTRY), word(7), word(MEMBER), word(p.botNonce), word(1_795_000_000)]);
+    expect(message.length).toBe(224);
+    expect([message[0], message[1]]).toEqual([0xe6, 0x6f]);
+    expect(bytesToHex(message)).toBe(bytesToHex(expected));
+  });
+
+  it("is never the challenge for the same fields, and changes with every field", () => {
+    const message = bytesToHex(leaveMessage(p));
+    expect(message).not.toBe(bytesToHex(challengeMessage(p)));
+    expect(bytesToHex(leaveMessage({ ...p, guest: CHAIR }))).not.toBe(message);
+    expect(bytesToHex(leaveMessage({ ...p, boardId: 8n }))).not.toBe(message);
+    expect(bytesToHex(leaveMessage({ ...p, botNonce: `0x${"b2".repeat(32)}` }))).not.toBe(message);
+    expect(bytesToHex(leaveMessage({ ...p, expiry: 1_795_000_001n }))).not.toBe(message);
+  });
+
+  it("cannot be read as text or as a length-prefixed message (C3)", () => {
+    const message = leaveMessage(p);
+    expect(() => new TextDecoder("utf-8", { fatal: true }).decode(message.slice(0, 32))).toThrow();
+    const asLength = ((message[0] ?? 0) * 2 ** 24 + (message[1] ?? 0) * 2 ** 16 + (message[2] ?? 0) * 2 ** 8 + (message[3] ?? 0)) >>> 0;
+    expect(asLength).toBeGreaterThan(message.length);
+  });
+
+  it("refuses board 0, a zero nonce and a zero expiry", () => {
+    expect(() => leaveMessage({ ...p, boardId: 0n })).toThrow(ActionError);
+    expect(() => leaveMessage({ ...p, botNonce: `0x${"00".repeat(32)}` })).toThrow(ActionError);
+    expect(() => leaveMessage({ ...p, expiry: 0n })).toThrow(ActionError);
   });
 });

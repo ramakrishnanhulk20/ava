@@ -4,7 +4,8 @@ Every change to a board is authorised by one ML-DSA-87 signature from the board'
 chain by QoreChain's `pqcVerify` precompile against the key `pqcKeyStatus` returns for the chair.
 Anyone may submit the transaction; the sender grants nothing. This page is the single source for the
 message format. The Solidity contract and the TypeScript library both build these bytes, and a shared
-test vector proves they match byte for byte (threat model C4).
+test vector proves they match byte for byte (threat model C4). A third implementation,
+`packages/core/crosscheck/check_actions.py`, rebuilds the same vectors from this page alone.
 
 ## Message
 
@@ -83,3 +84,17 @@ abi.encode(bytes32 keccak256("ava.challenge.v1"), uint256 chainId, address regis
 
 The first byte of that tag hash is 0x00. The bot issues `botNonce` and `expiry`, and never signs bytes
 that arrive in a request.
+
+## Guest leave request (demo board only)
+
+A guest who wants to leave the demo board signs, with its own registered ML-DSA-87 key:
+
+```
+abi.encode(bytes32 keccak256("ava.leave.v1"), uint256 chainId, address registry, uint256 boardId, address guest, bytes32 botNonce, uint64 expiry)
+```
+
+It is 224 bytes, like the challenge, under its own tag, so a signature that admits can never remove
+and a signature that removes can never admit. The tag hash starts 0xe6, 0x6f, which is not valid
+UTF-8, and its first four bytes read as a length are far larger than the message. The bot issues
+`botNonce` and `expiry` for this purpose only, checks the signature against the key the chain holds
+for `guest`, and then removes that guest and nobody else.

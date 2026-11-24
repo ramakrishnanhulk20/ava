@@ -11,6 +11,8 @@ export const REST = "https://api-testnet.qore.host";
 export const BOARD_TAG: Hex = keccak256(stringToBytes("ava.board.v1"));
 /** First word of every guest challenge. Its first byte is 0x00. */
 export const CHALLENGE_TAG: Hex = keccak256(stringToBytes("ava.challenge.v1"));
+/** The first word of a guest's request to leave the demo board. Its own tag, so a signature that admits can never remove (threat model C47). */
+export const LEAVE_TAG: Hex = keccak256(stringToBytes("ava.leave.v1"));
 
 /** The action codes the registry accepts, as signed in the message. */
 export const Action = {

@@ -7,6 +7,7 @@ import {
   ActionError,
   actionMessage,
   challengeMessage,
+  leaveMessage,
   paramsAdd,
   paramsCreate,
   paramsPost,
@@ -18,7 +19,7 @@ import {
 import { sameAccount } from "../src/address.ts";
 import { Action, MAX_DEADLINE_AHEAD, ML_DSA_87_PUBKEY, ML_DSA_87_SIG, ML_KEM_1024_PUBKEY, Mode } from "../src/constants.ts";
 import { generateMnemonic, identityFromMnemonic, type Identity } from "../src/identity.ts";
-import { signAction, signBoardAction, signChallenge, verifyAction } from "../src/sign.ts";
+import { signAction, signBoardAction, signChallenge, signLeave, verifyAction } from "../src/sign.ts";
 
 const REGISTRY = "0x00000000000000000000000000000000000a0a0a";
 const LATEST = 1_795_000_000n;
@@ -194,5 +195,40 @@ describe("signChallenge", () => {
     const edge = sign(LATEST + BigInt(MAX_DEADLINE_AHEAD));
     expect(verifyAction(chair.mldsa.publicKey, edge.message, edge.signature)).toBe(true);
     expect(() => sign(LATEST + BigInt(MAX_DEADLINE_AHEAD) + 1n)).toThrow(ActionError);
+  });
+});
+
+describe("signLeave", () => {
+  const fields = () => ({ registry: REGISTRY, boardId: 7n, guest: chair.evm, botNonce: HASH("b1") });
+
+  it("builds the leave bytes itself and signs exactly those (C45, C47)", () => {
+    const expiry = LATEST + 300n;
+    const smuggled = { ...fields(), message: challengeMessage({ ...fields(), expiry }) };
+    const signed = signLeave(chair.mldsa.secretKey, { ...smuggled, expiry, latestBlockTimestamp: LATEST });
+    const expected = leaveMessage({ ...fields(), expiry });
+    expect(bytesToHex(signed.message)).toBe(bytesToHex(expected));
+    expect(signed.signature).toHaveLength(ML_DSA_87_SIG);
+    expect(verifyAction(chair.mldsa.publicKey, expected, signed.signature)).toBe(true);
+  });
+
+  it("gives a signature that is no use as a join, and a join signature that is no use to leave", () => {
+    const expiry = LATEST + 300n;
+    const leave = signLeave(chair.mldsa.secretKey, { ...fields(), expiry, latestBlockTimestamp: LATEST });
+    const join = signChallenge(chair.mldsa.secretKey, { ...fields(), expiry, latestBlockTimestamp: LATEST });
+    expect(verifyAction(chair.mldsa.publicKey, challengeMessage({ ...fields(), expiry }), leave.signature)).toBe(false);
+    expect(verifyAction(chair.mldsa.publicKey, leaveMessage({ ...fields(), expiry }), join.signature)).toBe(false);
+  });
+
+  it("refuses an expiry at the latest block or more than MAX_DEADLINE_AHEAD past it (C2)", () => {
+    const sign = (expiry: bigint) => signLeave(chair.mldsa.secretKey, { ...fields(), expiry, latestBlockTimestamp: LATEST });
+    expect(() => sign(LATEST)).toThrow(ActionError);
+    expect(() => sign(LATEST + BigInt(MAX_DEADLINE_AHEAD) + 1n)).toThrow(ActionError);
+    const edge = sign(LATEST + BigInt(MAX_DEADLINE_AHEAD));
+    expect(verifyAction(chair.mldsa.publicKey, edge.message, edge.signature)).toBe(true);
+  });
+
+  it("is the only way to sign a leave: the raw signer refuses those bytes", () => {
+    const message = leaveMessage({ ...fields(), expiry: LATEST + 300n });
+    expect(() => signAction(chair.mldsa.secretKey, message)).toThrow(ActionError);
   });
 });
