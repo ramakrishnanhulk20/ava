@@ -40,7 +40,7 @@ afterEach(() => {
 
 describe("the model's world", () => {
   it("relays one public chair action to the chain, which lands it and moves the board's nonce", async () => {
-    const world = await World.create(cast, { fillers: 0, fillerStepMinutes: 20, tightLimits: false, demoRelaysPerHour: 120, preSpend: 0 });
+    const world = await World.create(cast, { fillers: 0, fillerStepMinutes: 20, tightLimits: false, demoRelaysPerHour: 120, preSpend: 0, seedPack: true });
     world.begin("relay");
     const response = await handleRelay(appRequest("/api/relay", rotateBody(world, 1n, 10n, 1)), world.relayContext(CLIENT_IPS[0]));
     world.end();
@@ -52,7 +52,7 @@ describe("the model's world", () => {
   });
 
   it("admits one guest through a challenge and a signed join, and the add lands on the demo board", async () => {
-    const world = await World.create(cast, { fillers: 2, fillerStepMinutes: 20, tightLimits: false, demoRelaysPerHour: 120, preSpend: 0 });
+    const world = await World.create(cast, { fillers: 2, fillerStepMinutes: 20, tightLimits: false, demoRelaysPerHour: 120, preSpend: 0, seedPack: true });
     const guest = cast.guests[0];
     if (guest === undefined) throw new Error("The cast has no guest.");
     world.begin("join");

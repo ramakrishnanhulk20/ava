@@ -26,5 +26,20 @@ export { handleRelay, type RelayContext } from "./relay.ts";
 export { ensureWindow, type WindowDeps } from "./window.ts";
 export { liveRelayer } from "./chain/live.ts";
 export { handleSponsor, liveSponsor, type SponsorChain, type SponsorContext, type SponsorLimits } from "./sponsor.ts";
-export { freeDemoSeats, handleDemoChallenge, handleDemoJoin, sweepDemoGuests, type DemoContext, type DemoLimits, type DemoSweepContext, type PressureOutcome, type RemovalReason, type SweepOutcome } from "./demo.ts";
+export {
+  ensureCurrentPack,
+  freeDemoSeats,
+  handleDemoChallenge,
+  handleDemoJoin,
+  handleDemoLeave,
+  handleDemoLeaveChallenge,
+  sweepDemoGuests,
+  type DemoContext,
+  type DemoLimits,
+  type DemoSweepContext,
+  type PackOutcome,
+  type PressureOutcome,
+  type RemovalReason,
+  type SweepOutcome,
+} from "./demo.ts";
 export { liveDemoChain, type DemoChain } from "./demoBoard.ts";

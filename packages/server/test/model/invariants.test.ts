@@ -1,4 +1,4 @@
-// A randomised model of the relay, the demo bot and the document path. Each run builds a fresh
+// A randomised model of the relay, the demo bot, its demo pack, a guest's signed leave and the document path. Each run builds a fresh
 // world (the real MemoryStore on a clock the model moves, the real MemoryBlobBackend, and one stub
 // chain that can be slow, lose transactions, lose receipts, lie in receipts and see foreign use of
 // the relayer's key), drives the real handlers with up to 60 commands, and checks every promise
@@ -29,12 +29,15 @@
 // reads; only the demo bot's ML-DSA signatures are real. createBoard and transferChair are never
 // relayed, fee quotes never spike, gas estimates never pass a ceiling, the sponsor and the chain
 // proxy are not driven, and native window opens and closes never revert once committed. The
-// browser's own receipt checks (C26) belong to the web app and are not here.
+// browser's own receipt checks (C26) belong to the web app and are not here. A leave is signed whenever
+// the scheduler lets it: the browser's check of its expiry against the latest block is core's to test,
+// and only accounts whose signing keys the model holds (guests and three early members) can leave.
 import fc from "fast-check";
-import { hexToBytes } from "viem";
+import { hexToBytes, type Hex } from "viem";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as config from "../../src/config.ts";
 import { admittedKey } from "../../src/demo.ts";
+import { DEMO_PACK_TEXT } from "../../src/demoPack.ts";
 import * as docupload from "../../src/docupload.ts";
 import { DOCUMENT_KEEP_MS } from "../../src/docupload.ts";
 import { clientKey } from "../../src/ratelimit.ts";
@@ -71,6 +74,8 @@ vi.mock("../../src/config.ts", async (importOriginal) => {
 });
 
 const RUNS = Number(process.env.MODEL_RUNS ?? 300);
+/** The bytes the bot encrypts for every pack it posts. */
+const PACK = new TextEncoder().encode(DEMO_PACK_TEXT);
 /** Set for the planted-bug runs: the first property that fails ends the check. */
 const STOP_AT_FIRST = process.env.MODEL_STOP_AT_FIRST !== undefined;
 const MAX_COMMANDS = Number(process.env.MODEL_COMMANDS ?? 60);
@@ -190,14 +195,14 @@ const INVARIANTS: Invariant[] = [
   },
   {
     id: 2,
-    title: "no join removes anyone, even one that meets a board another join filled while it waited for the lock, and every removal is a sweep's or a pressure pass's, of a guest",
+    title: "no join removes anyone, even one that meets a board another join filled while it waited for the lock, and every removal is a sweep's, a pressure pass's or a leave's, of a guest",
     check: async (h) => {
       const w = h.world;
       // A removal is placed by the request that handed it over, so a join's own, however it met a
       // full board, is named here as a join's.
       const protectedMembers = [w.cast.chair.evm, ...w.cast.seeded.map((s) => s.evm)].map(lower);
       for (const r of w.removals) {
-        if (r.command !== "sweep" && r.command !== "pressure") return `a removeMember of ${r.member} was handed to the node during a ${r.command} (command #${r.seq})`;
+        if (r.command !== "sweep" && r.command !== "pressure" && r.command !== "leave") return `a removeMember of ${r.member} was handed to the node during a ${r.command} (command #${r.seq})`;
         if (protectedMembers.includes(lower(r.member))) return `a removeMember of ${r.member}, the chair or a seeded director, was handed to the node during a ${r.command} (command #${r.seq})`;
       }
       const missing = protectedMembers.filter((m) => !w.isMember(DEMO_BOARD, m));
@@ -299,11 +304,13 @@ const INVARIANTS: Invariant[] = [
       const w = h.world;
       const today = utcDay(w.now);
       const yesterday = utcDay(w.now - 86_400_000);
-      const posts = [...w.txs.values()].filter((t) => t.what === "send" && t.scope === "public" && t.action === "post");
+      // The public chairs' posts and the demo bot's packs alike.
+      const posts = [...w.txs.values()].filter((t) => t.what === "send" && t.action === "post");
       for (const day of [yesterday, today]) {
         const onDay = posts.filter((t) => t.requestDay === day);
         const noon = Date.parse(`${day}T12:00:00Z`);
-        const ledgers = [{ key: ledgerFor("posts", noon).key, of: onDay }, ...PUBLIC_CHAIRS.map((chair) => ({ key: ledgerFor("chair_posts", noon, chair).key, of: onDay.filter((t) => lower(t.chair ?? "") === lower(chair)) }))];
+        const chairs = [...PUBLIC_CHAIRS, w.cast.chair.evm];
+        const ledgers = [{ key: ledgerFor("posts", noon).key, of: onDay }, ...chairs.map((chair) => ({ key: ledgerFor("chair_posts", noon, chair).key, of: onDay.filter((t) => lower(t.chair ?? "") === lower(chair)) }))];
         for (const { key, of } of ledgers) {
           const spent = (await meant(h, key)) - (await meant(h, `${key}:settled`));
           const verified = of.reduce((sum, t) => sum + (t.cipherSize ?? 0n), 0n);
@@ -411,7 +418,7 @@ const INVARIANTS: Invariant[] = [
   },
   {
     id: 11,
-    title: "no removal takes the demo board below DEMO_GUEST_CAP minus DEMO_FREE_SEATS members unless its guest was due anyway: six hours old, or with a KEM key gone wrong",
+    title: "no sweep's or pass's removal takes the demo board below DEMO_GUEST_CAP minus DEMO_FREE_SEATS members unless its guest was due anyway: six hours old, or with a KEM key gone wrong",
     check: async (h) => h.world.belowFloor[0],
   },
   {
@@ -478,6 +485,80 @@ const INVARIANTS: Invariant[] = [
       return undefined;
     },
   },
+  {
+    id: 16,
+    title: "the demo bot hands a pack to the node only for an epoch that has none, at most one lands per epoch, and every guest member holding the current epoch's key opens the bot's pack for it to the pack text's bytes",
+    check: async (h) => {
+      const w = h.world;
+      const trouble = w.packTrouble[0];
+      if (trouble !== undefined) return trouble;
+      const board = w.board(DEMO_BOARD);
+      const pack = board.documents.find((d) => d.bot && d.epoch === board.epoch);
+      if (pack === undefined) return undefined;
+      const protectedMembers = [w.cast.chair.evm, ...w.cast.seeded.map((s) => s.evm)].map(lower);
+      for (const member of board.members) {
+        if (protectedMembers.includes(lower(member))) continue;
+        const wrong = await w.packRead(member, pack, PACK);
+        if (wrong !== undefined) return `guest member ${member} holds the key of epoch ${board.epoch}, yet the bot's pack for that epoch (${pack.cipherHash.slice(0, 12)}) ${wrong}`;
+      }
+      return undefined;
+    },
+  },
+  {
+    id: 17,
+    title:
+      "a leave removes the seat of the account that signed it and no other, at most once for each leave request, and only on that account's own signature over a leave request the bot issued; a leave its sender could have failed costs nothing; no leave admits; and nobody taken off the board opens a key of the current epoch",
+    check: async (h) => {
+      const w = h.world;
+      const txs = [...w.txs.values()];
+      const usedBy = new Map<string, number>();
+      for (const r of w.removals) {
+        if (r.command !== "leave") continue;
+        const asked = r.flow === undefined ? undefined : h.leaveFlows.get(r.flow);
+        const what = `the removeMember of ${r.member} handed to the node during a leave (command #${r.seq})`;
+        if (asked === undefined || r.flow === undefined) return `${what} came from a request that carried no leave`;
+        if (!asked.valid) return `${what} came from a leave for ${asked.account} that was not that account's own signature over a leave request the bot issued`;
+        if (lower(r.member) !== lower(asked.account)) return `${what} is not of ${asked.account}, the account that signed the leave`;
+        const first = usedBy.get(asked.nonce);
+        if (first !== undefined && first !== r.flow) return `${what} is the second removal handed over on one leave request (bot nonce ${asked.nonce.slice(0, 12)})`;
+        usedBy.set(asked.nonce, r.flow);
+      }
+      const other = txs.find((t) => t.what === "send" && t.command === "leave" && t.action !== "remove");
+      if (other !== undefined) return `a leave handed ${t2s(other)} to the node, which is not a removal`;
+      for (const l of h.leaves) {
+        if (l.seq !== w.seq || l.flow === undefined) continue;
+        const what = `the leave for ${l.account} (${l.how}) answered ${l.status} ${l.error ?? ""} at command #${l.seq}`;
+        if (l.asJoin) {
+          if (l.status === 202) return `${what} by the join endpoint: a leave signature admitted its signer`;
+          continue;
+        }
+        const mark = admittedKey(hexToBytes(l.account));
+        if (l.status === 202) {
+          // One admission per address, ever (C34): leaving is never a way back in.
+          if (!l.concurrent && (await w.store.inner.get(mark)) === null) return `${what}, yet the account holds no admission mark, so it could be admitted again`;
+          continue;
+        }
+        // Everything the sender can fail, and every refusal before the bot seals or relays anything.
+        const senders = l.status >= 400 && l.status < 500;
+        const early = senders || (l.status === 503 && ["busy", "demo_busy", "kem_unavailable", "protected_key_unusable"].includes(l.error ?? ""));
+        const sent = txs.find((t) => t.flow === l.flow);
+        if (early && sent !== undefined) return `${what} still handed ${t2s(sent)} to the node`;
+        if (senders || l.error === "demo_busy") {
+          const ops = w.store.log.slice(l.logFrom).filter((op) => op.flow === l.flow && op.wrote);
+          const reserved = ops.find((op) => op.key.startsWith("rate:relay:demo:"));
+          if (reserved !== undefined) return `${what} still reserved a demo relay (${reserved.key})`;
+          if (ops.some((op) => op.key === mark)) return `${what} still wrote the account's admission mark`;
+        }
+      }
+      const board = w.board(DEMO_BOARD);
+      const removed = new Set(txs.filter((t) => t.boardId === DEMO_BOARD && t.action === "remove" && t.state === "landed" && t.member !== undefined).map((t) => lower(t.member as string)));
+      for (const member of removed) {
+        if (w.isMember(DEMO_BOARD, member)) continue;
+        if (w.opensCurrentEpoch(member as Hex)) return `${member} was taken off the demo board, yet its own keys open an envelope of the board's current epoch ${board.epoch}`;
+      }
+      return undefined;
+    },
+  },
 ];
 
 /** How often each invariant's interesting case came up across the clean runs, so a pass is never a pass over nothing. */
@@ -522,6 +603,27 @@ async function tally(h: Harness): Promise<void> {
   add("10: joins answered demo_busy", h.joins.filter((j) => j.error === "demo_busy").length);
   add("10: passes and sweeps refused demo_busy", h.answers.filter((a) => (a.startsWith("sweep demo:") || a.startsWith("pressure:")) && a.includes("demo_busy")).length);
   add("11: removals landed with the board at or under its floor", w.floorRemovals);
+  add("16: packs handed to the node", txs.filter((t) => t.what === "send" && t.action === "post" && t.boardId === DEMO_BOARD).length);
+  add("16: packs of the bot's that landed", w.board(DEMO_BOARD).documents.filter((d) => d.bot).length);
+  add("16: pack checks that found the pack in place", h.answers.filter((a) => a.includes(`"done":"current"`)).length);
+  add("16: pack checks refused", h.answers.filter((a) => (a.startsWith("pack:") && a.includes(`"done":"refused"`)) || a.includes(`pack {"done":"refused"`) || a.includes(`"pack":{"done":"refused"`)).length);
+  add("16: guest members who held the epoch's key and opened its pack", [...w.packReads.values()].filter((r) => r.held && r.wrong === undefined).length);
+  const leaves = h.leaves.filter((l) => !l.asJoin);
+  const refusedAs = (...errors: string[]): number => leaves.filter((l) => errors.includes(l.error ?? "")).length;
+  add("17: leaves answered 202", leaves.filter((l) => l.status === 202).length);
+  add("17: leave removals that landed", txs.filter((t) => t.command === "leave" && t.action === "remove" && t.state === "landed").length);
+  add("17: forged leaves sent (wrong signer, join bytes, join nonce)", leaves.filter((l) => ["wrongSigner", "joinBytes", "joinNonce"].includes(l.how)).length);
+  add("17: leaves refused bad_signature", refusedAs("bad_signature"));
+  add("17: leaves refused no_challenge or challenge_mismatch", refusedAs("no_challenge", "challenge_mismatch"));
+  add("17: leaves refused protected_member", refusedAs("protected_member"));
+  add("17: leaves refused not_a_member", refusedAs("not_a_member"));
+  add("17: leaves refused rate_limited", refusedAs("rate_limited"));
+  add("17: leaves refused demo_busy", refusedAs("demo_busy"));
+  add("17: leaves refused busy, kem_unavailable or protected_key_unusable", refusedAs("busy", "kem_unavailable", "protected_key_unusable"));
+  add("17: leaves sent again by a retry", leaves.filter((l) => l.how === "retried").length);
+  add("17: leave signatures tried at the join endpoint", h.leaves.filter((l) => l.asJoin).length);
+  add("17: leaves that overlapped another request", leaves.filter((l) => l.concurrent).length);
+  add("17: account and envelope pairs tried by someone off the board", w.outsiderReads.size);
   add("store writes applied twice", w.store.retried);
   for (const [op, n] of Object.entries(w.store.retriedBy)) add(`2: lost replies on ${op}`, n);
   add("2: lost replies after a command's fortieth write", w.store.retriedLate);
@@ -545,6 +647,8 @@ function property(active: ReadonlySet<number>) {
       history: [],
       relays: [],
       joins: [],
+      leaves: [],
+      leaveFlows: new Map(),
       sweeps: [],
       answers: [],
       nextSalt: 1,

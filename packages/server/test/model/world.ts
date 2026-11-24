@@ -1,6 +1,25 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { Action, KemKeyUnavailable, Mode, actionMessage, generateMnemonic, identityFromMnemonic, paramsAdd, paramsRemove, sealEpochKey, newEpochKey, sha256, toHex, verifyAction, type Identity, type KemRecipient } from "@ava/core";
+import {
+  Action,
+  KemKeyUnavailable,
+  Mode,
+  actionMessage,
+  decryptDocument,
+  generateMnemonic,
+  identityFromMnemonic,
+  openEpochKey,
+  paramsAdd,
+  paramsPost,
+  paramsRemove,
+  sealEpochKey,
+  newEpochKey,
+  sha256,
+  toHex,
+  verifyAction,
+  type Identity,
+  type KemRecipient,
+} from "@ava/core";
 import { evmWindowCost, weiToUqorCeil, type EvmWindow } from "@qorechain/evm";
 import { generateSealKeys, type SealKeyPair } from "@qorechain/qoreseal";
 import type { Scheduler } from "fast-check";
@@ -63,7 +82,7 @@ const SLOW_LAND_MS = 2_500;
 const SIGNATURE_BYTES = 4_627;
 /** Limits a run of sixty commands can reach, so the refusals at each one are exercised too. */
 const TIGHT_RELAY_LIMITS: RelayLimits = { perIp: 8, perChair: 6, perBoard: 5, total: 12, rejected: 6, windowSeconds: 3600 };
-const TIGHT_DEMO_LIMITS: DemoLimits = { join: { perIp: 3, windowSeconds: 3600, perDay: 6 }, challenge: { perIp: 5, total: 12, windowSeconds: 3600 } };
+const TIGHT_DEMO_LIMITS: DemoLimits = { join: { perIp: 3, windowSeconds: 3600, perDay: 6 }, challenge: { perIp: 5, total: 12, windowSeconds: 3600 }, leave: { perIp: 2, windowSeconds: 3600 } };
 const GET_BOARD = toFunctionSelector("getBoard(uint256)");
 const ACTION_OF: Readonly<Record<string, RelayAction | undefined>> = { addMember: "add", removeMember: "remove", rotateEpoch: "rotate", postDocument: "post", transferChair: "transfer", createBoard: "create" };
 const CREATE_NONCES = toFunctionSelector("createNonces(address)");
@@ -124,6 +143,15 @@ export interface ChainTx {
   requestDay?: string;
 }
 
+/** One document a board holds, in the order the registry recorded them. `bot` marks the demo bot's own packs. */
+export interface DocumentModel {
+  docRef: Hex;
+  cipherHash: Hex;
+  cipherSize: bigint;
+  epoch: bigint;
+  bot: boolean;
+}
+
 export interface BoardModel {
   id: bigint;
   chair: Hex;
@@ -132,6 +160,7 @@ export interface BoardModel {
   nonce: bigint;
   members: Hex[];
   grants: Grant[];
+  documents: DocumentModel[];
 }
 
 export interface ChainEvent {
@@ -157,17 +186,25 @@ export interface Cast {
   chair: Identity;
   seeded: readonly [Identity, Identity];
   guests: readonly Identity[];
+  /** Members seated before the run began who hold signing keys of their own, so they can sign a leave. They are the first of the fillers. */
+  early: readonly Identity[];
   fillers: readonly SeatOnly[];
   /** The demo board's seed envelope for each filler count, sealed once. */
   seedEnvelopes: Map<number, { boardRef: Hex; envelope: Uint8Array }>;
 }
 
-export async function makeCast(guestCount = 6, fillerCount = 36): Promise<Cast> {
+export async function makeCast(guestCount = 6, fillerCount = 36, earlyCount = 3): Promise<Cast> {
   const chairPhrase = generateMnemonic();
-  const ids = await Promise.all(Array.from({ length: 3 + guestCount }, (_, i) => identityFromMnemonic(i === 0 ? chairPhrase : generateMnemonic())));
-  const [chair, asha, ben, ...guests] = ids as [Identity, Identity, Identity, ...Identity[]];
-  const fillers = Array.from({ length: fillerCount }, (_, i) => ({ evm: toHex(Uint8Array.from({ length: 20 }, (_, j) => (j === 19 ? i + 1 : j === 0 ? 0x5e : 0xf0))), seal: generateSealKeys() }));
-  return { chairPhrase, chair, seeded: [asha, ben], guests, fillers, seedEnvelopes: new Map() };
+  const earlySeats = Math.min(earlyCount, fillerCount);
+  const ids = await Promise.all(Array.from({ length: 3 + guestCount + earlySeats }, (_, i) => identityFromMnemonic(i === 0 ? chairPhrase : generateMnemonic())));
+  const [chair, asha, ben, ...rest] = ids as [Identity, Identity, Identity, ...Identity[]];
+  const guests = rest.slice(0, guestCount);
+  const early = rest.slice(guestCount);
+  const fillers = [
+    ...early.map((e): SeatOnly => ({ evm: e.evm, seal: e.seal })),
+    ...Array.from({ length: fillerCount - earlySeats }, (_, i) => ({ evm: toHex(Uint8Array.from({ length: 20 }, (_, j) => (j === 19 ? i + 1 : j === 0 ? 0x5e : 0xf0))), seal: generateSealKeys() })),
+  ];
+  return { chairPhrase, chair, seeded: [asha, ben], guests, early, fillers, seedEnvelopes: new Map() };
 }
 
 /** The pair qor_getKEMKey answers, in the frozen shape fetchKemKey builds. */
@@ -183,6 +220,8 @@ export interface WorldInit {
   demoRelaysPerHour: number;
   /** The share of each daily ledger already booked before the run starts. */
   preSpend: 0 | 0.5 | 0.97;
+  /** Whether the demo board starts with a pack for its epoch, as the seed script leaves it, or with none, so the first pack is the bot's. */
+  seedPack: boolean;
 }
 
 export interface StoreOp {
@@ -378,7 +417,7 @@ export class WorldStore implements SharedStore {
       return await fn();
     } finally {
       this.#holding.set(lockKey, (this.#holding.get(lockKey) ?? 1) - 1);
-      await this.#hooks.turn(`unlock ${key}`);
+      await this.#hooks.turn(`release ${key}`);
       if ((await this.inner.get(lockKey)) === token) await this.inner.delete(lockKey);
     }
   }
@@ -474,6 +513,11 @@ export interface Flow {
   startedAt: number;
   /** For a public relay: the UTC day it arrived, the day its post bytes are booked on. */
   requestDay?: string;
+  /**
+   * The UTC day of the last wall clock read this request made. The bot reads it once it holds the
+   * lock for a post and books that post's bytes on its day.
+   */
+  wallDay?: string;
 }
 
 /** A turn count past which an overlap is taken to be stuck in a loop, so the run stops instead of hanging. */
@@ -518,14 +562,20 @@ export class World {
   foreignSeq?: number;
   /** Our own sends and opens broadcast after a foreign transaction had already used the nonce. */
   readonly broadcastAfterForeign: ChainTx[] = [];
-  /** Removals on the demo board, with the command that relayed them. */
-  readonly removals: { member: Hex; command: string; seq: number }[] = [];
+  /** Removals on the demo board, with the command and the request that relayed them. */
+  readonly removals: { member: Hex; command: string; seq: number; flow?: number }[] = [];
   /** Sends handed over at a board nonce, or as a copy, while an earlier one there was still pending. */
   readonly doubleHanded: string[] = [];
   /** Removals that landed on a board of DEMO_GUEST_CAP minus DEMO_FREE_SEATS members or fewer, of a guest not due by the model. */
   readonly belowFloor: string[] = [];
   /** Removals that landed with the board at or under that floor, the case the floor check reads. */
   floorRemovals = 0;
+  /** Demo packs handed to the node for an epoch that already had a pack, or that landed beside another of the bot's for one epoch. */
+  readonly packTrouble: string[] = [];
+  /** Whether an account's own seal keys opened an envelope a grant names, by account and envelope: what someone off the board would try. */
+  readonly outsiderReads = new Map<string, boolean>();
+  /** What each guest member made of each bot pack it was checked against, by pack, member and grants seen: whether it held the epoch's key, and what went wrong. */
+  readonly packReads = new Map<string, { held: boolean; wrong?: string }>();
   /** When each member was admitted, by the world clock: the seed, or the start of the join whose add landed. */
   readonly admittedAt = new Map<string, number>();
   /** The last time each account's KEM record was anything but its own key, or its lookup failed. */
@@ -582,11 +632,13 @@ export class World {
       nonce: 11n,
       members: members.map((m) => m.evm),
       grants: [{ envelopeHash, envelopeSize: seed.envelope.length, mode: Mode.ROTATE, member: ZERO }],
+      // The seed script's packs are not the bot's: no property reads their bytes.
+      documents: init.seedPack ? [{ docRef: keccak256(new TextEncoder().encode("seed pack")), cipherHash: keccak256(new TextEncoder().encode("seed pack bytes")), cipherSize: 1_700n, epoch: 3n, bot: false }] : [],
     });
     this.events.push({ block: this.heightAt(T0 - HOUR), boardId: DEMO_BOARD, kind: "granted", envelopeHash, member: ZERO });
     for (const [i, id] of PUBLIC_BOARDS.entries()) {
       const chair = PUBLIC_CHAIRS[i === 2 ? 1 : 0];
-      this.boards.set(id, { id, chair, boardRef: bytesToHex(sha256(new TextEncoder().encode(`public ${id}`))), epoch: 3n, nonce: 10n, members: [chair], grants: [] });
+      this.boards.set(id, { id, chair, boardRef: bytesToHex(sha256(new TextEncoder().encode(`public ${id}`))), epoch: 3n, nonce: 10n, members: [chair], grants: [], documents: [] });
     }
     for (const [i, f] of fillers.entries()) {
       const at = T0 - (i + 1) * init.fillerStepMinutes * 60_000;
@@ -631,6 +683,12 @@ export class World {
   }
 
   clock = (): number => this.mono;
+  /** The world time, noting its UTC day on the request that read it. */
+  wallClock = (): number => {
+    const flow = this.flows.getStore();
+    if (flow !== undefined) flow.wallDay = utcDay(this.now);
+    return this.now;
+  };
   sleep = async (ms: number): Promise<void> => {
     await this.turn("sleep");
     this.advance(ms);
@@ -798,12 +856,15 @@ export class World {
         };
       }
       case "postDocument": {
-        const [, , cipherHash, cipherSize, epoch] = args as [bigint, Hex, Hex, bigint, bigint];
+        const [, docRef, cipherHash, cipherSize, epoch] = args as [bigint, Hex, Hex, bigint, bigint];
         if (epoch !== board.epoch) return { ok: false, error: "WrongEpoch" };
         return {
           ok: true,
           apply: () => {
+            const bot = boardId === DEMO_BOARD;
+            if (bot && board.documents.some((d) => d.bot && d.epoch === epoch)) this.packTrouble.push(`a second pack of the bot's landed for epoch ${epoch} at command #${this.seq}`);
             board.nonce += 1n;
+            board.documents.push({ docRef, cipherHash, cipherSize, epoch, bot });
             this.events.push({ block: this.height(), boardId, kind: "posted", cipherHash, cipherSize });
           },
         };
@@ -835,6 +896,10 @@ export class World {
         const [, member, envelopeHash, envelopeSize, epochAfter] = args as [bigint, Hex, Hex, number, bigint];
         paramsHash = paramsRemove({ member: getAddress(member), envelopeHash, envelopeSize, epochAfter });
         action = Action.REMOVE;
+      } else if (functionName === "postDocument") {
+        const [, docRef, cipherHash, cipherSize, epoch] = args as [bigint, Hex, Hex, bigint, bigint];
+        paramsHash = paramsPost({ docRef, cipherHash, cipherSize, epoch });
+        action = Action.POST;
       } else {
         return false;
       }
@@ -863,7 +928,8 @@ export class World {
     this.confirmed += 1n;
     const verdict = revert || tx.data === undefined ? undefined : this.judge(tx.data);
     if (verdict?.ok === true) {
-      if (tx.boardId === DEMO_BOARD && tx.action === "remove" && tx.member !== undefined) this.#checkFloor(tx.member);
+      // A guest who signed its own leave goes whatever the board holds; the floor is the passes' rule.
+      if (tx.boardId === DEMO_BOARD && tx.action === "remove" && tx.member !== undefined && tx.command !== "leave") this.#checkFloor(tx.member);
       verdict.apply();
       if (tx.boardId === DEMO_BOARD && tx.action === "add" && tx.member !== undefined) this.admittedAt.set(lower(tx.member), tx.flowStartedAt);
       tx.state = "landed";
@@ -893,6 +959,91 @@ export class World {
     if (!due) {
       this.belowFloor.push(`a removeMember of ${member} landed on a board of ${board.members.length} members, already at or under ${floor}, though it was admitted ${Math.round((this.now - (since ?? this.now)) / 60_000)} minutes ago with its own KEM key`);
     }
+  }
+
+  /** A pack is handed to the node only for an epoch with no document, and none of the bot's for it still pending. */
+  #checkPackSend(board: BoardModel, epoch: bigint, record: ChainTx): void {
+    const what = `${record.command} handed over a pack for epoch ${epoch} (command #${this.seq})`;
+    const held = board.documents.find((d) => d.epoch === epoch);
+    if (held !== undefined) this.packTrouble.push(`${what}, though that epoch already had ${held.bot ? "a pack of the bot's" : "the seed's pack"}`);
+    const pending = [...this.txs.values()].find((t) => t.boardId === board.id && t.action === "post" && t.state === "pending" && t.data !== undefined && this.#postEpoch(t.data) === epoch);
+    if (pending !== undefined) this.packTrouble.push(`${what} while ${pending.command}'s pack for it (command #${pending.seq}) was still pending`);
+  }
+
+  #postEpoch(data: Hex): bigint {
+    return (decodeFunctionData({ abi: boardRegistryAbi, data }).args as readonly unknown[])[4] as bigint;
+  }
+
+  /** The QoreSeal keys of a member the cast knows: a guest or a filler. */
+  sealOf(member: string): SealKeyPair | undefined {
+    return [...this.cast.guests, ...this.cast.fillers].find((k) => lower(k.evm) === lower(member))?.seal;
+  }
+
+  /**
+   * Whether an account's own seal keys open any envelope the demo board's current epoch grants: what
+   * an account taken off the board would try with the keys it still holds. Each account and envelope
+   * pair is tried once; an envelope the blob store no longer holds opens for nobody.
+   */
+  opensCurrentEpoch(member: Hex): boolean {
+    const board = this.board(DEMO_BOARD);
+    const seal = this.sealOf(member);
+    if (seal === undefined) return false;
+    for (const grant of board.grants) {
+      const key = `${lower(member)}:${grant.envelopeHash}`;
+      let opened = this.outsiderReads.get(key);
+      if (opened === undefined) {
+        const envelope = this.blobs.blobs.get(`envelope/${grant.envelopeHash.slice(2).toLowerCase()}`);
+        if (envelope === undefined) continue;
+        try {
+          openEpochKey({ registry: REGISTRY_ADDRESS, boardRef: board.boardRef, epoch: board.epoch, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: seal });
+          opened = true;
+        } catch {
+          opened = false;
+        }
+        this.outsiderReads.set(key, opened);
+      }
+      if (opened) return true;
+    }
+    return false;
+  }
+
+  /**
+   * What a guest member makes of the bot's pack for the demo board's current epoch, opening it as a
+   * member would: an envelope of the epoch's grants with its own seal keys, then the document the
+   * post names, from the blob store. Undefined when it opens to `plain`, or when the member holds no
+   * key for the epoch; otherwise what went wrong. Kept per pack, member and grant count, since the
+   * pack's bytes never change and a member gains a grant only by joining.
+   */
+  async packRead(member: Hex, pack: DocumentModel, plain: Uint8Array): Promise<string | undefined> {
+    const board = this.board(DEMO_BOARD);
+    const key = `${pack.cipherHash}:${lower(member)}:${board.grants.length}`;
+    const known = this.packReads.get(key);
+    if (known !== undefined) return known.wrong;
+    const seal = this.sealOf(member);
+    let epochKey: Uint8Array | undefined;
+    for (const grant of seal === undefined ? [] : board.grants) {
+      const envelope = this.blobs.blobs.get(`envelope/${grant.envelopeHash.slice(2).toLowerCase()}`);
+      if (envelope === undefined || seal === undefined) continue;
+      try {
+        epochKey = openEpochKey({ registry: REGISTRY_ADDRESS, boardRef: board.boardRef, epoch: board.epoch, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: seal });
+        break;
+      } catch {
+        // Not sealed to this member; the next grant may be.
+      }
+    }
+    let verdict: string | undefined;
+    if (epochKey !== undefined) {
+      const ciphertext = this.blobs.blobs.get(`document/${pack.cipherHash.slice(2).toLowerCase()}`);
+      try {
+        if (ciphertext === undefined) throw new Error("the blob store holds nothing under its name");
+        const opened = await decryptDocument({ epochKey, registry: REGISTRY_ADDRESS, boardRef: board.boardRef, epoch: pack.epoch, docRef: pack.docRef, ciphertext, expectedHash: pack.cipherHash, expectedSize: pack.cipherSize });
+        if (!Buffer.from(opened).equals(Buffer.from(plain))) verdict = `opens to ${opened.length} bytes that are not the pack text's ${plain.length}`;
+      } catch (error) {
+        verdict = `does not open: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    this.packReads.set(key, { held: epochKey !== undefined, ...(verdict === undefined ? {} : { wrong: verdict }) });
+    return verdict;
   }
 
   /** Sets one account's KEM record, and remembers when it stopped being the account's own. */
@@ -1027,12 +1178,13 @@ export class World {
       boardId,
       action,
       chair: board.chair,
-      requestDay: this.flow()?.requestDay,
+      requestDay: this.flow()?.requestDay ?? (scope === "demo" ? this.flow()?.wallDay : undefined),
     };
     if (functionName === "addMember" || functionName === "removeMember") record.member = getAddress((args as readonly unknown[])[1] as Hex);
     if (functionName === "postDocument") {
       record.cipherHash = (args as readonly unknown[])[2] as Hex;
       record.cipherSize = (args as readonly unknown[])[3] as bigint;
+      if (boardId === DEMO_BOARD) this.#checkPackSend(board, (args as readonly unknown[])[4] as bigint, record);
     }
     const earlier = [...this.txs.values()].find((t) => t.what === "send" && t.boardId === boardId && signedNonce !== undefined && t.signedNonce === signedNonce && t.state === "pending");
     if (earlier !== undefined) {
@@ -1041,7 +1193,7 @@ export class World {
     }
     this.txs.set(hash, record);
     if (this.foreignSeq !== undefined) this.broadcastAfterForeign.push(record);
-    if (functionName === "removeMember" && boardId === DEMO_BOARD && record.member !== undefined) this.removals.push({ member: record.member, command: this.command, seq: this.seq });
+    if (functionName === "removeMember" && boardId === DEMO_BOARD && record.member !== undefined) this.removals.push({ member: record.member, command: this.command, seq: this.seq, flow: this.flow()?.id });
     const w = this.readWindow();
     if (fate === "refuse" || !w.live || w.remainingTxs <= 0n || w.remainingValue < worst) {
       record.state = "unknown";
@@ -1122,7 +1274,7 @@ export class World {
         if (req.data.startsWith(GET_BOARD)) {
           const board = this.boards.get(BigInt(`0x${req.data.slice(10)}`));
           if (board === undefined) return { ok: false, revertData: revertWith("UnknownBoard") };
-          const result = { chair: board.chair, boardRef: board.boardRef, epoch: board.epoch, nonce: board.nonce, memberCount: board.members.length, documentCount: 0 };
+          const result = { chair: board.chair, boardRef: board.boardRef, epoch: board.epoch, nonce: board.nonce, memberCount: board.members.length, documentCount: board.documents.length };
           return { ok: true, data: encodeFunctionResult({ abi: boardRegistryAbi, functionName: "getBoard", result }) };
         }
         if (req.data.startsWith(CREATE_NONCES)) return { ok: true, data: encodeFunctionResult({ abi: boardRegistryAbi, functionName: "createNonces", result: 0n }) };
@@ -1187,7 +1339,7 @@ export class World {
 
   #demoChain(): DemoChain {
     const proven = (who: Identity): KeyStatus => ({ registered: true, algorithmId: 1, pubkey: who.mldsa.publicKey, possessionProven: true });
-    const known = [this.cast.chair, ...this.cast.seeded, ...this.cast.guests];
+    const known = [this.cast.chair, ...this.cast.seeded, ...this.cast.guests, ...this.cast.early];
     return {
       board: async (boardId): Promise<BoardSnapshot> => {
         await this.#lag("board");
@@ -1202,6 +1354,8 @@ export class World {
           nonce: board.nonce,
           members: [...board.members],
           grants: board.grants.map((g) => ({ ...g })),
+          documentCount: board.documents.length,
+          latestDocumentEpoch: board.documents.at(-1)?.epoch,
         };
       },
       keyStatus: async (account) => {
@@ -1280,7 +1434,7 @@ export class World {
       relayChain: this.relayChain,
       clock: this.clock,
       sleep: this.sleep,
-      wallClock: () => this.now,
+      wallClock: this.wallClock,
     };
   }
 

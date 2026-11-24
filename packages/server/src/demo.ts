@@ -1,10 +1,27 @@
 import { randomUUID } from "node:crypto";
-import { KemKeyUnavailable, Mode, accountBytes, challengeMessage, identityFromMnemonic, newEpochKey, sameAccount, sameHash, sealEpochKey, toHex, type Identity, type KemRecipient } from "@ava/core";
+import {
+  KemKeyUnavailable,
+  Mode,
+  accountBytes,
+  challengeMessage,
+  encryptDocument,
+  identityFromMnemonic,
+  leaveMessage,
+  newDocRef,
+  newEpochKey,
+  sameAccount,
+  sameHash,
+  sealEpochKey,
+  sha256,
+  toHex,
+  type Identity,
+  type KemRecipient,
+} from "@ava/core";
 import { mldsa87 } from "@qorechain/pqc";
 import { validateMlkemPublicKey } from "@qorechain/qoreseal";
 import { bytesToHex, hexToBytes, type Hex } from "viem";
 import { z } from "zod";
-import type { BlobBackend } from "./blob.ts";
+import { sameUrl, type BlobBackend } from "./blob.ts";
 import type { RelayerAddress } from "./chain/account.ts";
 import { OutOfTime, elapsedMs, leftMs, startDeadline, within, type Deadline } from "./chain/deadline.ts";
 import type { RelayChain } from "./chain/types.ts";
@@ -16,6 +33,7 @@ import {
   DEMO_GUEST_CAP,
   DEMO_GUEST_TTL_SECONDS,
   DEMO_JOIN_LIMITS,
+  DEMO_LEAVE_LIMITS,
   DEMO_LOCK_TTL_SECONDS,
   DEMO_LOCK_WAIT_MS,
   DEMO_RECEIPT_WAIT_MS,
@@ -33,7 +51,9 @@ import {
   type BoardSnapshot,
   type DemoChain,
 } from "./demoBoard.ts";
-import { requireDemoChairMnemonic, type ServerEnv } from "./env.ts";
+import { DEMO_PACK_TEXT } from "./demoPack.ts";
+import { writeVerifiedMark } from "./docupload.ts";
+import { isHttpsOrigin, requireDemoChairMnemonic, type ServerEnv } from "./env.ts";
 import { BodyTimeout, declaredLength, json, readBody, refuse, refuseCrossSite, TooLarge, type HandlerContext } from "./http.ts";
 import { logEvent } from "./log.ts";
 import { countClient } from "./ratelimit.ts";
@@ -45,6 +65,8 @@ export interface DemoLimits {
   /** Join requests per IP per window, and joins whose addMember is relayed per UTC day. */
   join: { perIp: number; windowSeconds: number; perDay: number };
   challenge: { perIp: number; total: number; windowSeconds: number };
+  /** Leave requests per IP per window; DEMO_LEAVE_LIMITS when absent. Leave challenges use `challenge`. */
+  leave?: { perIp: number; windowSeconds: number };
 }
 
 export type DemoContext = HandlerContext & {
@@ -83,11 +105,14 @@ export type DemoSweepContext = Omit<DemoContext, "clientIp" | "limits" | "backgr
  * member's, its key lookup has come back unreadable on three sweeps in a row, or a pressure pass is
  * freeing seats ahead of the next judges.
  */
-export type RemovalReason = "expired" | "key_missing" | "key_invalid" | "key_changed" | "key_shared" | "key_unreadable" | "pressure";
+export type RemovalReason = "expired" | "key_missing" | "key_invalid" | "key_changed" | "key_shared" | "key_unreadable" | "pressure" | "left";
 
 type Removed = { done: "removed"; member: Hex; reason: RemovalReason; txHash: Hex; epochAfter: string; landed: boolean };
 
 export type SweepOutcome = { done: "not_ready" } | { done: "nothing_due"; guests: number; unknown: number } | Removed | { done: "refused"; reason: string };
+
+/** What one ensureCurrentPack call did: posted the pack for `epoch`, found that epoch's pack in place, or refused and changed nothing. */
+export type PackOutcome = { done: "posted"; txHash: Hex; epoch: bigint } | { done: "current" } | { done: "refused"; reason: string };
 
 /** What one pressure pass did (threat model C41): every removal it made, in order, and why it stopped. */
 export interface PressureOutcome {
@@ -107,6 +132,7 @@ type SweepMode = "expiry" | "pressure";
 export const DEMO_LOCK = "demo:join";
 /** The hour's challenge total for every caller, under the key `limit` kept it in, so its count carries over. */
 const CHALLENGE_TOTAL_KEY = "rate:demo-challenge:all";
+const LEAVE_CHALLENGE_TOTAL_KEY = "rate:demo-leave-challenge:all";
 /**
  * A consumed challenge is left as a tombstone naming the join that consumed it, for a minute: longer
  * than the store client's retries of that write (three tries of at most 3 s), so the join's read-back
@@ -169,8 +195,12 @@ const UNREADABLE_RUN_SECONDS = 86_400;
 /** A block timestamp at or past this (the year 2255) is not one the chain could have written. */
 const MAX_UNIX_SECONDS = 9_000_000_000n;
 const DEFAULT_LIMITS: DemoLimits = { join: DEMO_JOIN_LIMITS, challenge: DEMO_CHALLENGE_LIMITS };
+/** The exact bytes ensureCurrentPack encrypts. Undefined for an empty pack text, so every post is refused and nothing else changes. */
+const DEMO_PACK: Uint8Array | undefined = DEMO_PACK_TEXT.length > 0 ? new TextEncoder().encode(DEMO_PACK_TEXT) : undefined;
 
 export const challengeKey = (guest: Uint8Array): string => `demo:challenge:${bytesToHex(guest)}`;
+/** A guest's live leave request, kept apart from its join challenge so neither can stand in for the other (threat model C47). */
+export const leaveKey = (guest: Uint8Array): string => `demo:leave:${bytesToHex(guest)}`;
 export const admittedKey = (guest: Uint8Array): string => `demo:admitted:${bytesToHex(guest)}`;
 const utcDay = (now: number): string => new Date(now).toISOString().slice(0, 10);
 const joinDayKey = (now: number): string => `demo:join:count:${utcDay(now)}`;
@@ -305,8 +335,18 @@ function freshNonce(): Hex {
   return bytesToHex(bytes);
 }
 
-function challengeAnswer(boardId: bigint, guest: Uint8Array, record: { botNonce: Hex; expiry: bigint }): Response {
-  const message = challengeMessage({ registry: REGISTRY_ADDRESS, boardId, guest: toHex(guest), botNonce: record.botNonce, expiry: record.expiry });
+/** What a signed request is for. Each purpose has its own message, its own record and its own counters. */
+interface Purpose {
+  scope: string;
+  totalKey: string;
+  key: (guest: Uint8Array) => string;
+  message: typeof challengeMessage;
+}
+const JOIN: Purpose = { scope: "demo-challenge", totalKey: CHALLENGE_TOTAL_KEY, key: challengeKey, message: challengeMessage };
+const LEAVE: Purpose = { scope: "demo-leave-challenge", totalKey: LEAVE_CHALLENGE_TOTAL_KEY, key: leaveKey, message: leaveMessage };
+
+function challengeAnswer(purpose: Purpose, boardId: bigint, guest: Uint8Array, record: { botNonce: Hex; expiry: bigint }): Response {
+  const message = purpose.message({ registry: REGISTRY_ADDRESS, boardId, guest: toHex(guest), botNonce: record.botNonce, expiry: record.expiry });
   return json(200, { registry: REGISTRY_ADDRESS, boardId: boardId.toString(), botNonce: record.botNonce, expiry: record.expiry.toString(), message: bytesToHex(message) });
 }
 
@@ -329,7 +369,22 @@ function challengeAnswer(boardId: bigint, guest: Uint8Array, record: { botNonce:
  * seconds, 429 over the hourly total for every caller, counted only once the body has passed, so
  * junk never uses up anyone else's room, and 503 when the shared store fails.
  */
-export async function handleDemoChallenge(request: Request, ctx: DemoContext): Promise<Response> {
+export function handleDemoChallenge(request: Request, ctx: DemoContext): Promise<Response> {
+  return issue(request, ctx, JOIN);
+}
+
+/**
+ * Issues the request a guest signs to leave the demo board (threat model C47). The same checks,
+ * limits and answers as handleDemoChallenge, under its own counters, with `message` the 224 bytes
+ * of leaveMessage and the record under "demo:leave:<guest>". A join challenge and a leave request
+ * for one guest are separate records with separate nonces, and their bytes carry different tags.
+ */
+export function handleDemoLeaveChallenge(request: Request, ctx: DemoContext): Promise<Response> {
+  return issue(request, ctx, LEAVE);
+}
+
+/** Issues one signed-request record for a purpose: a join challenge or a leave request. The checks are the same; the bytes, the record and the counters are the purpose's own. */
+async function issue(request: Request, ctx: DemoContext, purpose: Purpose): Promise<Response> {
   const crossSite = refuseCrossSite(request);
   if (crossSite !== undefined) return crossSite;
   if (request.method !== "POST") return refusal(405, "method_not_allowed", {}, { allow: "POST" });
@@ -338,7 +393,7 @@ export async function handleDemoChallenge(request: Request, ctx: DemoContext): P
   const rules = (ctx.limits ?? DEFAULT_LIMITS).challenge;
   const retry = { "retry-after": String(rules.windowSeconds) };
   // Junk counts against its own IP (and /48), and against everyone's total only once its body is valid.
-  const client = await countClient(ctx.store, { scope: "demo-challenge", clientIp: ctx.clientIp, perIp: rules.perIp, windowSeconds: rules.windowSeconds });
+  const client = await countClient(ctx.store, { scope: purpose.scope, clientIp: ctx.clientIp, perIp: rules.perIp, windowSeconds: rules.windowSeconds });
   if (!client.ok) return refusal(429, "rate_limited", { limit: client.refusedBy ?? "per_ip" }, retry);
 
   const read = await readJson(request, CHALLENGE_BODY_CAP);
@@ -348,7 +403,7 @@ export async function handleDemoChallenge(request: Request, ctx: DemoContext): P
   if (guest === undefined) return refusal(400, "bad_guest");
   let total: number;
   try {
-    total = await ctx.store.incrWindow(CHALLENGE_TOTAL_KEY, rules.windowSeconds);
+    total = await ctx.store.incrWindow(purpose.totalKey, rules.windowSeconds);
   } catch {
     return refusal(503, "store_unavailable");
   }
@@ -356,15 +411,15 @@ export async function handleDemoChallenge(request: Request, ctx: DemoContext): P
 
   const record = { botNonce: freshNonce(), expiry: nowSeconds(ctx.now) + BigInt(DEMO_CHALLENGE_SECONDS) };
   const fresh = JSON.stringify({ botNonce: record.botNonce, expiry: record.expiry.toString() });
-  const key = challengeKey(guest);
+  const key = purpose.key(guest);
   try {
-    if (await ctx.store.setIfAbsent(key, fresh, DEMO_CHALLENGE_SECONDS)) return challengeAnswer(boardId, guest, record);
+    if (await ctx.store.setIfAbsent(key, fresh, DEMO_CHALLENGE_SECONDS)) return challengeAnswer(purpose, boardId, guest, record);
     // A write that landed but lost its reply reads back as this fresh challenge, which is live.
     const held = await ctx.store.get(key);
     const live = parseChallenge(held);
-    if (live !== undefined && live.expiry > nowSeconds(ctx.now)) return challengeAnswer(boardId, guest, live);
+    if (live !== undefined && live.expiry > nowSeconds(ctx.now)) return challengeAnswer(purpose, boardId, guest, live);
     if (held !== null && CONSUMED.test(held)) {
-      if ((await ctx.store.compareAndSet(key, held, fresh, DEMO_CHALLENGE_SECONDS)) || (await ctx.store.get(key)) === fresh) return challengeAnswer(boardId, guest, record);
+      if ((await ctx.store.compareAndSet(key, held, fresh, DEMO_CHALLENGE_SECONDS)) || (await ctx.store.get(key)) === fresh) return challengeAnswer(purpose, boardId, guest, record);
     }
   } catch {
     return refusal(503, "store_unavailable");
@@ -905,8 +960,9 @@ async function joinProven(ctx: DemoContext, proven: { boardId: bigint; guest: Ui
   } catch (error) {
     response = error instanceof LockBusy ? refusal(503, "busy", fields, { "retry-after": "30" }) : refusal(503, "store_unavailable", fields);
   }
-  // Only once the lock is released, so the pass never waits on the join that asked for it.
-  if (pressure.value) await schedulePressure(ctx);
+  // Only once the lock is released, so the background work never waits on the join that asked for it.
+  const passed = pressure.value && (await schedulePressure(ctx));
+  if (response.status === 202 && !passed) schedulePack(ctx);
   return response;
 }
 
@@ -942,32 +998,194 @@ async function releasePass(store: SharedStore, token: string): Promise<void> {
 }
 
 /**
- * Hands one pressure pass to the caller's background runner (threat model C41), unless a pass is
- * already scheduled or running: it claims the pass mark first, and the pass releases it when done.
- * The pass runs on the join's wall clock, or Date.now, so each of its removals runs on the time it
- * runs at and not on the join's arrival. Without a runner nothing is scheduled and the scheduled
- * sweep does the work. A store failure or a runner that throws is logged, and the join's own
- * answer stands.
+ * Hands one pressure pass, then one ensureCurrentPack, to the caller's background runner (threat
+ * model C41), unless a pass is already scheduled or running: it claims the pass mark first, and the
+ * pass releases it when done. Both run on the join's wall clock, or Date.now, so each removal and
+ * the post run on the time they run at and not on the join's arrival. The work answers the pass's
+ * PressureOutcome, with `pack` added whenever ensureCurrentPack did more than find the current
+ * epoch's pack in place. Without a runner nothing is scheduled and the scheduled sweep does the
+ * work. A store failure or a runner that throws is logged, and the join's own answer stands.
+ *
+ * @returns Whether the work was handed to the runner.
  */
-async function schedulePressure(ctx: DemoContext): Promise<void> {
+async function schedulePressure(ctx: DemoContext): Promise<boolean> {
   const boardId = ctx.env.DEMO_BOARD_ID;
-  if (ctx.background === undefined || boardId === undefined || ctx.env.DEMO_CHAIR_MNEMONIC === undefined) return;
+  if (ctx.background === undefined || boardId === undefined || ctx.env.DEMO_CHAIR_MNEMONIC === undefined) return false;
   let token: string | undefined;
   try {
     token = await claimPass(ctx.store);
   } catch {
     logEvent("demo_pressure_unscheduled", { reason: "store_unavailable" });
-    return;
+    return false;
   }
-  if (token === undefined) return;
+  if (token === undefined) return false;
   const wallClock = ctx.wallClock ?? Date.now;
   const pass = token;
   try {
-    ctx.background(() => pressurePass({ ...ctx, wallClock }, boardId, pass));
+    ctx.background(async () => {
+      const sweep = { ...ctx, wallClock };
+      const outcome = await pressurePass(sweep, boardId, pass);
+      // After the pass, so a pass that moved the epoch several times leads to one post, for the last.
+      const pack = await ensureCurrentPack(sweep);
+      return pack.done === "current" ? outcome : { ...outcome, pack };
+    });
+    return true;
   } catch {
     await releasePass(ctx.store, pass);
     logEvent("demo_pressure_unscheduled", {});
+    return false;
   }
+}
+
+/**
+ * Hands one ensureCurrentPack to the caller's background runner after an admitted join that
+ * scheduled no pressure pass (threat model C41), so a guest seated on a quiet board whose current
+ * epoch has no pack gets one without waiting for the scheduled sweep. It runs on the join's wall
+ * clock, or Date.now, read once it holds the lock, and answers its PackOutcome. Runs of it and of a
+ * pass meet under the "demo:join" lock, so a second one finds the first one's pack. Without a
+ * runner nothing is scheduled. A runner that throws is logged, and the join's own answer stands.
+ */
+function schedulePack(ctx: DemoContext): void {
+  if (ctx.background === undefined) return;
+  const sweep = { ...ctx, wallClock: ctx.wallClock ?? Date.now };
+  try {
+    ctx.background(() => ensureCurrentPack(sweep));
+  } catch {
+    logEvent("demo_pack_unscheduled", {});
+  }
+}
+
+/** The removal a proven leave request asks for, under the "demo:join" lock. */
+async function leaveOnce(ctx: DemoContext, boardId: bigint, guest: Uint8Array, deadline: Deadline): Promise<Response> {
+  // The request may have waited on the lock, so the hour and the day are read when the removal runs.
+  const run: DemoSweepContext = { ...ctx, now: (ctx.wallClock ?? Date.now)() };
+  const chair = await demoChair(run.env);
+  const snapshot = await readOwnBoard(run, boardId, chair, deadline);
+  const seeded = run.env.DEMO_SEEDED ?? [];
+  const address = toHex(guest);
+  if (sameAccount(address, snapshot.chair) || seeded.some((s) => sameAccount(s, address))) throw new DemoStop(403, "protected_member");
+  const seat = snapshot.members.find((m) => sameAccount(m, address));
+  if (seat === undefined) throw new DemoStop(409, "not_a_member");
+  const plan = await planRemoval(run, snapshot, "pressure", deadline, seat);
+  if ("done" in plan) throw new DemoStop(503, plan.done === "refused" ? plan.reason : "leave_failed");
+  if (!(await reserveDemoRelays(run.store, run.now, 1))) throw new DemoStop(503, "demo_busy");
+  // One admission per address, ever (C34): a member the bot holds no record of gets its mark
+  // before it goes, so leaving is never a way back in.
+  try {
+    await run.store.setIfAbsent(admittedKey(guest), String(run.now), ADMITTED_SECONDS);
+  } catch {
+    throw new DemoStop(503, "store_unavailable");
+  }
+  const removed = await removeGuest(run, chair, snapshot, plan, SWEEP_CLIENT_IP, deadline);
+  return json(202, { txHash: removed.txHash, epochAfter: removed.epochAfter });
+}
+
+/**
+ * Removes a guest from the demo board at its own signed request (threat model C47).
+ *
+ * POST `{ guest, botNonce, expiry, signature }` as JSON, `signature` the guest's ML-DSA-87
+ * signature over the leave request handleDemoLeaveChallenge issued. Every other field is dropped:
+ * the bot builds what it signs from its own reads.
+ *
+ * In order, each refusal leaving every member and every counter but this IP's as it was: a request
+ * another site's page could have sent (403 cross_site, refuseCrossSite); 405; 503 not_ready before
+ * the board is seeded; this IP's hourly leaves, every /64 of one IPv6 /48 sharing 4 times it (429,
+ * countClient); the body (415, 413, 408 after 20 seconds, 400, 400 bad_guest); the guest's stored
+ * leave request (409 no_challenge), its botNonce and expiry (403 challenge_mismatch) and the expiry
+ * not passed (403 challenge_expired); the guest's key from pqcKeyStatus, registered and possession
+ * proven (403 no_proven_key); a pure ML-DSA-87 signature over the leave bytes the bot rebuilds from
+ * its own record (403 bad_signature). Only the guest's own key can pass, and a join signature
+ * cannot: its bytes carry the other tag. Then the request is used up by compare-and-set to a
+ * tombstone with this call's own token, read back on a no, so one request removes at most once and
+ * a lost reply never refuses a valid one (409 no_challenge).
+ *
+ * Then, under the "demo:join" lock (503 busy after 20 s) and one 120 s deadline, on the wall clock
+ * read once the lock is held: the board read at one block, its chair checked to be the bot; the
+ * chair and the seeded directors refused (403 protected_member); an account with no seat refused
+ * (409 not_a_member); every other member's ML-KEM key looked up as a sweep does, a protected
+ * member's unusable key or another member's unreadable one refusing the leave because the next
+ * epoch could not be sealed to it (503 protected_key_unusable, 503 kem_unavailable; the leaver's
+ * own key is not needed); one of the hour's demo relays reserved (503 demo_busy, retry after the
+ * hour); the admission mark written if the bot held none, so an address is admitted once, ever;
+ * then the sweep's own removal: a fresh epoch key sealed to every other usable member, uploaded as
+ * the bot's own, removeMember signed with signBoardAction and relayed in scope "demo".
+ *
+ * After a 202 the demo chair's next pack is scheduled (ensureCurrentPack through `ctx.background`),
+ * sealed under the new epoch, for which the guest who left holds no key.
+ *
+ * @returns 202 `{ txHash, epochAfter }`: a claim the removeMember was sent, which the browser
+ *   confirms on chain (C26). A request refused after it was used up needs a fresh one.
+ */
+export async function handleDemoLeave(request: Request, ctx: DemoContext): Promise<Response> {
+  const crossSite = refuseCrossSite(request);
+  if (crossSite !== undefined) return crossSite;
+  const deadline = startDeadline(DEMO_DEADLINE_MS, ctx.clock);
+  if (request.method !== "POST") return refusal(405, "method_not_allowed", {}, { allow: "POST" });
+  const boardId = ctx.env.DEMO_BOARD_ID;
+  if (boardId === undefined || ctx.env.DEMO_CHAIR_MNEMONIC === undefined) return refusal(503, "not_ready");
+  const rules = ctx.limits?.leave ?? DEMO_LEAVE_LIMITS;
+  const client = await countClient(ctx.store, { scope: "demo-leave", clientIp: ctx.clientIp, perIp: rules.perIp, windowSeconds: rules.windowSeconds });
+  if (!client.ok) return refusal(429, "rate_limited", { limit: client.refusedBy ?? "per_ip" }, { "retry-after": String(rules.windowSeconds) });
+
+  const read = await readJson(request, JOIN_BODY_CAP);
+  if ("response" in read) return read.response;
+  const checked = JoinBody.safeParse(read.value);
+  if (!checked.success) return refusal(400, "bad_body");
+  const guest = guestBytes(checked.data.guest);
+  if (guest === undefined) return refusal(400, "bad_guest");
+  const fields: Fields = { guest: toHex(guest), leave: true };
+
+  const key = leaveKey(guest);
+  let raw: string | null;
+  try {
+    raw = await ctx.store.get(key);
+  } catch {
+    return refusal(503, "store_unavailable", fields);
+  }
+  const stored = parseChallenge(raw);
+  if (raw === null || stored === undefined) return refusal(409, "no_challenge", fields);
+  if (!sameHash(stored.botNonce, checked.data.botNonce) || stored.expiry !== checked.data.expiry) return refusal(403, "challenge_mismatch", fields);
+  if (stored.expiry <= nowSeconds(ctx.now)) return refusal(403, "challenge_expired", fields);
+
+  // The bytes checked are rebuilt from the bot's own record, never taken from the request.
+  const message = leaveMessage({ registry: REGISTRY_ADDRESS, boardId, guest: toHex(guest), botNonce: stored.botNonce, expiry: stored.expiry });
+  let publicKey: Uint8Array | undefined;
+  try {
+    publicKey = provenMldsaKey(await within(deadline, ctx.chain.keyStatus(toHex(guest)), "the key status read"));
+  } catch {
+    return refusal(502, "chain_unreachable", fields);
+  }
+  if (publicKey === undefined) return refusal(403, "no_proven_key", fields);
+  let valid = false;
+  try {
+    valid = mldsa87.verify(publicKey, message, checked.data.signature);
+  } catch {
+    valid = false;
+  }
+  if (!valid) return refusal(403, "bad_signature", fields);
+
+  const consumed = `consumed:${randomUUID()}`;
+  try {
+    if (!(await ctx.store.compareAndSet(key, raw, consumed, CONSUMED_SECONDS)) && (await ctx.store.get(key)) !== consumed) {
+      return refusal(409, "no_challenge", fields);
+    }
+  } catch {
+    return refusal(503, "store_unavailable", fields);
+  }
+
+  const waitMs = Math.floor(Math.max(0, Math.min(DEMO_LOCK_WAIT_MS, DEMO_RELAY_CUTOFF_MS - elapsedMs(deadline))));
+  let response: Response;
+  try {
+    response = await ctx.store.withLock(DEMO_LOCK, DEMO_LOCK_TTL_SECONDS, () => leaveOnce(ctx, boardId, guest, deadline), { waitMs });
+  } catch (error) {
+    if (error instanceof LockBusy) return refusal(503, "busy", fields, { "retry-after": "30" });
+    const stop = asStop(error, "leave_failed");
+    const wait = stop.reason === "demo_busy" ? untilNextHour((ctx.wallClock ?? Date.now)()) : "30";
+    return refusal(stop.status, stop.reason, fields, stop.status === 503 ? { "retry-after": wait } : {});
+  }
+  // The new epoch gets its pack once the lock is free; the guest who left holds no key for it.
+  if (response.status === 202) schedulePack(ctx);
+  return response;
 }
 
 /**
@@ -1035,9 +1253,11 @@ async function schedulePressure(ctx: DemoContext): Promise<void> {
  *
  * Seats are freed only in the background (C41): after a board_full answer, and after an admitted
  * join whose board now holds more than DEMO_GUEST_CAP minus DEMO_FREE_SEATS members, one pass of
- * freeDemoSeats is handed to `ctx.background` once the lock is released, unless a pass is already
- * scheduled or running (the "demo:pass" mark), so passes never pile up. Without it nothing is
- * scheduled, and sweepDemoGuests, which runs the same pass after its own step, is the only remover.
+ * freeDemoSeats, followed by one ensureCurrentPack, is handed to `ctx.background` once the lock is
+ * released, unless a pass is already scheduled or running (the "demo:pass" mark), so passes never
+ * pile up. Every other admitted join hands it ensureCurrentPack alone (schedulePack), so the epoch
+ * the guest was sealed into gets its pack. Without it nothing is scheduled, and sweepDemoGuests,
+ * which runs the same pass after its own step and ends with ensureCurrentPack, is the only remover.
  *
  * @returns 202 `{ txHash }`: a claim that the addMember was sent, which the browser confirms on chain (C26).
  */
@@ -1294,12 +1514,13 @@ async function unreadableRuns(store: SharedStore, keys: readonly MemberKey[], co
  *   because its passes are minutes apart; "pressure" for freeDemoSeats, whose passes can follow
  *   each other within seconds and so only read the runs.
  */
-async function planRemoval(ctx: DemoSweepContext, snapshot: BoardSnapshot, mode: SweepMode, deadline: Deadline): Promise<RemovalPlan | SweepOutcome> {
+async function planRemoval(ctx: DemoSweepContext, snapshot: BoardSnapshot, mode: SweepMode, deadline: Deadline, leaver?: Hex): Promise<RemovalPlan | SweepOutcome> {
   const seeded = ctx.env.DEMO_SEEDED ?? [];
   const isProtected = (m: Hex): boolean => sameAccount(m, snapshot.chair) || seeded.some((s) => sameAccount(s, m));
   const guests = snapshot.members.filter((m) => !isProtected(m));
   if (guests.length === 0) return { done: "nothing_due", guests: 0, unknown: 0 };
-  const times = await admissionTimes(ctx, snapshot.boardId, guests, deadline);
+  // A leaver goes whatever its age, so the grant logs that date undated guests are not read for it.
+  const times = leaver === undefined ? await admissionTimes(ctx, snapshot.boardId, guests, deadline) : [];
   const keys = await memberKeys(ctx, snapshot, isProtected, deadline);
   const runs = await unreadableRuns(ctx.store, keys, mode === "expiry", ctx.now);
   for (const k of keys) {
@@ -1309,7 +1530,12 @@ async function planRemoval(ctx: DemoSweepContext, snapshot: BoardSnapshot, mode:
     }
   }
   const named = (k: MemberKey): boolean => "unreadable" in k && (runs.get(k.member) ?? 0) >= UNREADABLE_RUNS_TO_REMOVE;
-  if (keys.some((k) => "unreadable" in k && !named(k))) return { done: "refused", reason: "kem_unavailable" };
+  // The leaver's own key is not needed to seal the epoch it will not be in.
+  const leaving = (m: Hex): boolean => leaver !== undefined && sameAccount(m, leaver);
+  if (keys.some((k) => "unreadable" in k && !named(k) && !leaving(k.member))) return { done: "refused", reason: "kem_unavailable" };
+  if (leaver !== undefined) {
+    return { member: leaver, reason: "left", recipients: keys.flatMap((k) => ("recipient" in k && !leaving(k.member) ? [k.recipient] : [])) };
+  }
 
   const ageOf = new Map(guests.map((m, i) => [m, times[i]]));
   // No admission time sorts last, so a guest of unknown age is never taken before a dated one.
@@ -1420,25 +1646,34 @@ async function removeOneLocked(sweep: DemoSweepContext, boardId: bigint, mode: S
  * hand a pass to, or a pass was cut off. A refused step, or a removal whose receipt was not seen,
  * runs no pass: it would meet the same refusal, or the board's nonce that has not moved.
  *
+ * Every sweep that gets past not_ready ends with ensureCurrentPack, so an epoch its own step or its
+ * pass moved to, or one a post earlier missed, gets its pack from the sweep that follows.
+ *
  * @returns What its own step did: not_ready, nothing_due (with the number of guests and of guests
  *   still undated because the grant log read failed), removed (with why, the transaction and
- *   whether its receipt was seen), or refused with a short reason; and `pressure`, what the pass
- *   did, whenever the pass did more than find room at once. Never throws for a failed step.
+ *   whether its receipt was seen), or refused with a short reason; `pressure`, what the pass did,
+ *   whenever the pass did more than find room at once; and `pack`, what ensureCurrentPack did,
+ *   whenever it did more than find the current epoch's pack in place. Never throws for a failed step.
  */
-export async function sweepDemoGuests(ctx: DemoSweepContext): Promise<SweepOutcome & { pressure?: PressureOutcome }> {
+export async function sweepDemoGuests(ctx: DemoSweepContext): Promise<SweepOutcome & { pressure?: PressureOutcome; pack?: PackOutcome }> {
   const boardId = ctx.env.DEMO_BOARD_ID;
   if (boardId === undefined || ctx.env.DEMO_CHAIR_MNEMONIC === undefined) return { done: "not_ready" };
   const outcome = await removeOneLocked(ctx, boardId, "expiry");
   if (outcome.done === "refused") logEvent("demo_sweep_refused", { reason: outcome.reason });
-  if (outcome.done !== "nothing_due" && !(outcome.done === "removed" && outcome.landed)) return outcome;
-  const pressure = await freeDemoSeats(ctx);
-  return pressure.removed.length === 0 && pressure.stopped.done === "room" ? outcome : { ...outcome, pressure };
+  let swept: SweepOutcome & { pressure?: PressureOutcome } = outcome;
+  if (outcome.done === "nothing_due" || (outcome.done === "removed" && outcome.landed)) {
+    const pressure = await freeDemoSeats(ctx);
+    if (pressure.removed.length > 0 || pressure.stopped.done !== "room") swept = { ...outcome, pressure };
+  }
+  const pack = await ensureCurrentPack(ctx);
+  return pack.done === "current" ? swept : { ...swept, pack };
 }
 
 /**
  * The pressure pass: frees seats on the demo board ahead of the next judges (threat model C34, C41,
  * C42), and the only remover besides sweepDemoGuests, which runs it too after its own step. It is
  * handed to a join's background runner and run by every scheduled sweep. No join ever removes anyone.
+ * It never posts: the caller that ran it follows it with ensureCurrentPack.
  *
  * While the board holds more than DEMO_GUEST_CAP minus DEMO_FREE_SEATS members (34), it removes the
  * guest planRemoval picks in "pressure" mode: a guest with a key problem first, as the sweep would,
@@ -1510,4 +1745,106 @@ async function pressurePass(ctx: DemoSweepContext, boardId: bigint, token: strin
   }
   logEvent("demo_pressure_pass", { removed: removed.length, stopped: stopped.done === "refused" ? stopped.reason : stopped.done });
   return { removed, stopped };
+}
+
+/**
+ * Writes the pack's ciphertext to the blob store under `document/<sha256>`, from the server and not
+ * through the public token route, then its verified mark with its size through the writer
+ * handleDocumentVerify uses (threat model C28, C44), so the relay's post check accepts it. The name
+ * is the SHA-256 of the bytes this server hashed and sent, and the URL the store answers is checked
+ * to be the one built from that name and BLOB_ORIGIN, by the one URL parser, before anything is
+ * signed for it. A blob left behind by a later refusal has no post on chain, so the document sweep
+ * deletes it two hours after its upload.
+ *
+ * @throws DemoStop 500 server_misconfigured for a BLOB_ORIGIN that is not https, 502 upload_failed
+ *   when the store refuses, 502 upload_mismatch for any other URL, 503 store_unavailable when the
+ *   mark cannot be written, 503 out_of_time past the deadline.
+ */
+async function storePack(ctx: DemoSweepContext, ciphertext: Uint8Array, deadline: Deadline): Promise<Hex> {
+  if (!isHttpsOrigin(ctx.env.BLOB_ORIGIN)) throw new DemoStop(500, "server_misconfigured");
+  const hex = bytesToHex(sha256(ciphertext)).slice(2);
+  const pathname = `document/${hex}`;
+  let stored: { url: string };
+  try {
+    stored = await within(deadline, ctx.blobs.put(pathname, ciphertext), "the pack upload");
+  } catch (error) {
+    throw asStop(error, "upload_failed");
+  }
+  if (!sameUrl(stored.url, `${ctx.env.BLOB_ORIGIN}/${pathname}`)) throw new DemoStop(502, "upload_mismatch");
+  try {
+    await writeVerifiedMark(ctx.store, hex, ciphertext.length);
+  } catch {
+    throw new DemoStop(503, "store_unavailable");
+  }
+  return `0x${hex}`;
+}
+
+/**
+ * Posts the demo pack for the demo board's current epoch when that epoch has none (threat model
+ * C33, C41, C44), so every guest admitted to the board can open a pack.
+ *
+ * Under the "demo:join" lock the removals and joins take (150 s, waiting at most 20 s, else refused
+ * busy), on its own 120 s deadline, and on the wall clock read once the lock is held, never on
+ * `ctx.now`: the board is read at the latest block, its chair checked to be the bot. A board whose
+ * documentCount is above 0 and whose latest document's epoch is the board's epoch answers current,
+ * having reserved, opened, stored and signed nothing. Otherwise, in order: one of this clock hour's
+ * demo relays reserved (refused demo_busy); the current epoch's key opened as the demo chair from
+ * an envelope whose size and SHA-256 match the record (openCurrentEpochKey, an OpenedEpochKey,
+ * C12); a fresh docRef; the pack text (demoPack.ts) as UTF-8, encrypted under that key with
+ * encryptDocument; the ciphertext stored with its verified mark (storePack); postDocument built from
+ * the bot's own board read and signed by the demo chair with signBoardAction, its deadline
+ * DEMO_ACTION_SECONDS after that read's block time; then relayed through handleRelay in scope
+ * "demo", so the demo's daily ledger and the post bytes budget apply, and its receipt waited for.
+ * The bot signs nothing that came from a caller: there is no caller.
+ *
+ * A post's epoch is the one the board read showed, so a call after a pass that moved the epoch
+ * several times posts once, for the last. A second call, or one that waited for the lock behind
+ * this one, finds the pack in place. A post signed at a board nonce another action still holds in
+ * flight is refused by the relay (409 nonce_in_flight). Any refusal changes nothing for any member.
+ *
+ * @returns posted, with the transaction (a claim it was sent, landed or not) and the epoch; current;
+ *   or refused with a short reason: not_ready, pack_unavailable, busy, demo_busy, a board read or
+ *   envelope refusal as a join gets them, storePack's, a relay refusal, reverted or out_of_time.
+ *   Never throws.
+ */
+export async function ensureCurrentPack(sweep: DemoSweepContext): Promise<PackOutcome> {
+  const boardId = sweep.env.DEMO_BOARD_ID;
+  if (boardId === undefined || sweep.env.DEMO_CHAIR_MNEMONIC === undefined) return { done: "refused", reason: "not_ready" };
+  const pack = DEMO_PACK;
+  if (pack === undefined) return { done: "refused", reason: "pack_unavailable" };
+  const deadline = startDeadline(DEMO_DEADLINE_MS, sweep.clock);
+  const postLocked = async (): Promise<PackOutcome> => {
+    // A run can start minutes after the join or sweep that asked for it, and waits on the lock.
+    const run: DemoSweepContext = { ...sweep, now: (sweep.wallClock ?? Date.now)() };
+    const chair = await demoChair(run.env);
+    const snapshot = await readOwnBoard(run, boardId, chair, deadline);
+    if (snapshot.documentCount > 0 && snapshot.latestDocumentEpoch === snapshot.epoch) return { done: "current" };
+    if (!(await reserveDemoRelays(run.store, run.now, 1))) return { done: "refused", reason: "demo_busy" };
+    const epochKey = await openCurrentEpochKey({
+      snapshot,
+      sealKeys: chair.seal,
+      blobs: run.blobs,
+      blobOrigin: run.env.BLOB_ORIGIN,
+      signal: AbortSignal.timeout(Math.max(1, Math.floor(leftMs(deadline)))),
+    });
+    const docRef = bytesToHex(newDocRef());
+    let ciphertext: Uint8Array;
+    try {
+      ciphertext = await encryptDocument({ epochKey, registry: REGISTRY_ADDRESS, boardRef: snapshot.boardRef, epoch: snapshot.epoch, docRef, plaintext: pack });
+    } finally {
+      epochKey.fill(0);
+    }
+    const cipherHash = await storePack(run, ciphertext, deadline);
+    const body = signedAction(chair, snapshot, { kind: "post", docRef, cipherHash, cipherSize: BigInt(ciphertext.length), epoch: snapshot.epoch });
+    const { txHash, landed } = await relayAndWait(run, SWEEP_CLIENT_IP, body, deadline, { value: false });
+    logEvent("demo_pack_posted", { boardId: boardId.toString(), epoch: snapshot.epoch.toString(), size: ciphertext.length, txHash, landed });
+    return { done: "posted", txHash, epoch: snapshot.epoch };
+  };
+  try {
+    return await sweep.store.withLock(DEMO_LOCK, DEMO_LOCK_TTL_SECONDS, postLocked, { waitMs: DEMO_LOCK_WAIT_MS });
+  } catch (error) {
+    const reason = error instanceof LockBusy ? "busy" : asStop(error, "pack_failed").reason;
+    logEvent("demo_pack_refused", { reason });
+    return { done: "refused", reason };
+  }
 }

@@ -249,6 +249,22 @@ export async function verifiedSize(store: SharedStore, sha256Hex: string): Promi
   return (await readVerified(store, sha256Hex))?.size;
 }
 
+/**
+ * Writes the "verified:<sha256>" mark of a document whose stored bytes this server hashed to that
+ * name, holding their size (threat model C28, C44). handleDocumentVerify writes its marks through
+ * here, and so does the demo bot for the pack it stores itself, so verifiedSize, and through it the
+ * relay's post check, reads one form. A mark already there is left as it is.
+ * @param sha256Hex The name as 64 lowercase hex characters with no 0x.
+ * @param size The stored length in bytes, from 1 to MAX_CIPHER_SIZE.
+ * @throws TypeError for any other name or size, before the store is touched; when the shared store fails.
+ */
+export async function writeVerifiedMark(store: SharedStore, sha256Hex: string, size: number): Promise<void> {
+  if (typeof sha256Hex !== "string" || !HEX.test(sha256Hex) || !Number.isSafeInteger(size) || sizeOf(String(size)) === undefined) {
+    throw new TypeError(`A verified mark names a 64-hex document and a size from 1 to ${MAX_CIPHER_SIZE} bytes.`);
+  }
+  await store.setIfAbsent(verifiedKey(sha256Hex), String(size), VERIFIED_SECONDS);
+}
+
 /** The block and the sizes a posted mark holds; sizes is undefined for a mark that records none. Undefined for a mark in no form this file writes. */
 function readPosted(raw: string): { block: string; sizes: bigint[] | undefined } | undefined {
   const parts = POSTED_MARK.exec(raw);
@@ -867,7 +883,7 @@ export async function handleDocumentVerify(request: Request, ctx: DocumentContex
   if ("rejected" in checked) return reject(checked.rejected);
 
   try {
-    await ctx.store.setIfAbsent(verifiedKey(target.hex), String(checked.size), VERIFIED_SECONDS);
+    await writeVerifiedMark(ctx.store, target.hex, checked.size);
   } catch {
     logEvent("docverify_refused", { reason: "shared_store_failed" });
     return refuse(503, "store_failed");

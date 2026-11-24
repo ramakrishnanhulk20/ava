@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { VercelBlobBackend, handleUpload } from "../src/blob.ts";
 import { liveRelayer } from "../src/chain/live.ts";
-import { handleDemoChallenge, handleDemoJoin, type DemoContext } from "../src/demo.ts";
+import { handleDemoChallenge, handleDemoJoin, handleDemoLeave, handleDemoLeaveChallenge, type DemoContext } from "../src/demo.ts";
 import { liveDemoChain } from "../src/demoBoard.ts";
 import { handleDocumentToken, handleDocumentVerify } from "../src/docupload.ts";
 import { loadEnv } from "../src/env.ts";
@@ -69,6 +69,20 @@ const ROUTES: ReadonlyMap<string, Handler> = new Map<string, Handler>([
     async (request, base) => {
       const ctx = demo(base);
       return ctx === undefined ? notConfigured("RELAYER_MNEMONIC") : handleDemoJoin(request, ctx);
+    },
+  ],
+  [
+    "/api/demo/leave/challenge",
+    async (request, base) => {
+      const ctx = demo(base);
+      return ctx === undefined ? notConfigured("RELAYER_MNEMONIC") : handleDemoLeaveChallenge(request, ctx);
+    },
+  ],
+  [
+    "/api/demo/leave",
+    async (request, base) => {
+      const ctx = demo(base);
+      return ctx === undefined ? notConfigured("RELAYER_MNEMONIC") : handleDemoLeave(request, ctx);
     },
   ],
 ]);

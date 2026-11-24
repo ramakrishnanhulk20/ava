@@ -1,9 +1,19 @@
-import { challengeMessage, sha256, signAction, toHex } from "@ava/core";
+import { challengeMessage, sha256, signAction, signLeave, toHex, type Identity } from "@ava/core";
 import fc from "fast-check";
 import { bytesToHex, encodeFunctionData, type Hex } from "viem";
 import { boardRegistryAbi } from "../../src/abi/boardRegistry.ts";
 import { DEMO_DEADLINE_MS, DEMO_GUEST_CAP, REGISTRY_ADDRESS } from "../../src/config.ts";
-import { freeDemoSeats, handleDemoChallenge, handleDemoJoin, sweepDemoGuests, type PressureOutcome } from "../../src/demo.ts";
+import {
+  ensureCurrentPack,
+  freeDemoSeats,
+  handleDemoChallenge,
+  handleDemoJoin,
+  handleDemoLeave,
+  handleDemoLeaveChallenge,
+  sweepDemoGuests,
+  type PackOutcome,
+  type PressureOutcome,
+} from "../../src/demo.ts";
 import { DOCUMENT_CAP, DOCUMENT_KEEP_MS, POSTED_SCAN_KEY, handleDocumentToken, handleDocumentVerify, parsePostedScan, sweepUnverified } from "../../src/docupload.ts";
 import { sweepUnreferencedEnvelopes } from "../../src/envelopeSweep.ts";
 import { handleRelay } from "../../src/relay.ts";
@@ -32,7 +42,39 @@ export type Sent =
   | { kind: "relay"; body: PublicBody; ip: string; boardId: bigint; nonce: bigint; salt: number }
   | { kind: "junk"; body: unknown; ip: string }
   | { kind: "challenge" | "join"; body: unknown; ip: string; guest: number }
+  | { kind: "leaveChallenge"; body: unknown; ip: string }
+  | LeaveSent
   | { kind: "token" | "verify"; body: unknown; ip: string };
+
+/**
+ * One leave request as sent: whose seat it names, whether the model signed it as that account would
+ * (its own key, the leave bytes, a leave request the bot issued), the bot nonce it carries, and
+ * whether it was posted to the join endpoint instead, where it must never admit.
+ */
+export interface LeaveSent {
+  kind: "leave";
+  body: unknown;
+  ip: string;
+  account: Hex;
+  valid: boolean;
+  nonce: Hex;
+  asJoin: boolean;
+}
+
+/** One leave request answered. */
+export interface LeaveRecord {
+  seq: number;
+  account: Hex;
+  how: string;
+  asJoin: boolean;
+  status: number;
+  error?: string;
+  flow?: number;
+  /** Sent while other requests overlapped it. */
+  concurrent: boolean;
+  /** The store's write log length when the leave request began, after its challenge request. */
+  logFrom: number;
+}
 
 /** One public relay: the nonce it acted at, what the chain held at that nonce, and the answer. */
 export interface RelayRecord {
@@ -77,6 +119,9 @@ export interface Harness {
   nextSalt: number;
   /** Every demo join answered, by command, so a mark that refused its guest can be told apart from one that sat idle. */
   joins: JoinRecord[];
+  /** Every leave request answered, and what each request that carried one was: whose seat, validly signed or not, and its bot nonce. */
+  leaves: LeaveRecord[];
+  leaveFlows: Map<number, { account: Hex; valid: boolean; nonce: Hex }>;
   /** Each demo sweep, and whether it got far enough to settle the marks joins left. */
   sweeps: { seq: number; settled: boolean }[];
   /** The scheduler's order of the last overlap, for the failure report. */
@@ -251,7 +296,7 @@ function clientRetry(pick: number, chaos: Chaos): Step {
   return command(name, (h) => {
     const earlier = h.history[pick % Math.max(1, h.history.length)];
     const guest = earlier !== undefined && "guest" in earlier ? String(earlier.guest) : undefined;
-    const kind = earlier?.kind === "join" ? "join" : "retry";
+    const kind = earlier?.kind === "join" ? "join" : earlier?.kind === "leave" ? "leave" : "retry";
     return step(h, kind, name, { ...chaos, guest }, async () => {
       if (earlier === undefined) return;
       const w = h.world;
@@ -270,6 +315,14 @@ function clientRetry(pick: number, chaos: Chaos): Step {
         case "challenge": {
           const answer = await answerOf(await guarded("handleDemoChallenge", () => handleDemoChallenge(appRequest("/api/demo/challenge", earlier.body), w.demoContext(earlier.ip))));
           h.answers.push(`retry challenge guest ${earlier.guest}: ${answer.status} ${answer.error ?? ""}`);
+          return;
+        }
+        case "leave":
+          await sendLeave(h, earlier, "retried");
+          return;
+        case "leaveChallenge": {
+          const answer = await answerOf(await guarded("handleDemoLeaveChallenge", () => handleDemoLeaveChallenge(appRequest("/api/demo/leave/challenge", earlier.body), w.demoContext(earlier.ip))));
+          h.answers.push(`retry leave challenge: ${answer.status} ${answer.error ?? ""}`);
           return;
         }
         case "token":
@@ -341,6 +394,75 @@ function demoJoin(guest: number, kind: JoinKind, ip: number, chaos: Chaos): Step
   return command(name, (h) => step(h, "join", name, { ...chaos, guest: String(guest) }, () => joinFlow(h, guest, kind, ip)));
 }
 
+/**
+ * How a leave request is made. "valid" is the app's own: a leave request asked for, signed by the
+ * account's own key through signLeave. The rest must never remove anyone: "wrongSigner" is another
+ * account's signature over the victim's leave bytes; "joinBytes" is the account's own signature over
+ * the join challenge's bytes for the leave request's nonce; "joinNonce" signs leave bytes for a nonce
+ * the join challenge issued; "asJoin" posts a valid leave to the join endpoint, where it must never admit.
+ */
+export type LeaveKind = "valid" | "wrongSigner" | "joinBytes" | "joinNonce" | "asJoin";
+
+/** Everyone the chain holds a signing key for: the guests, the members seated before the run, then the chair and the seeded directors, whom no leave may remove. */
+const signersOf = (w: World): Identity[] => [...w.cast.guests, ...w.cast.early, w.cast.chair, ...w.cast.seeded];
+
+/** Whose seat a leave names, picked before the request runs: one on the board now when `seated` and any is, else by position among everyone who can sign. */
+function leaverOf(h: Harness, pick: number, seated: boolean): Identity {
+  const w = h.world;
+  const everyone = signersOf(w);
+  const on = seated ? [...w.cast.guests, ...w.cast.early].filter((g) => w.isMember(DEMO_BOARD, g.evm)) : [];
+  return (on.length > 0 ? on[pick % on.length] : everyone[pick % everyone.length]) as Identity;
+}
+
+/** An account asks for a leave request, signs it and sends it: what the app does when a judge leaves the board, or a forgery of it. */
+async function leaveFlow(h: Harness, who: Identity, kind: LeaveKind, ip: number): Promise<void> {
+  const w = h.world;
+  const from = ipOf(ip);
+  const asked = { guest: who.qor1 };
+  const short = who.evm.slice(0, 10);
+  let issued: Awaited<ReturnType<typeof answerOf>>;
+  if (kind === "joinNonce") {
+    issued = await answerOf(await guarded("handleDemoChallenge", () => handleDemoChallenge(appRequest("/api/demo/challenge", asked), w.demoContext(from))));
+  } else {
+    h.history.push({ kind: "leaveChallenge", body: asked, ip: from });
+    issued = await answerOf(await guarded("handleDemoLeaveChallenge", () => handleDemoLeaveChallenge(appRequest("/api/demo/leave/challenge", asked), w.demoContext(from))));
+  }
+  if (issued.status !== 200) {
+    h.answers.push(`leave ${short} ${kind}: challenge ${issued.status} ${issued.error ?? ""}`);
+    return;
+  }
+  const botNonce = issued.body.botNonce as Hex;
+  const expiry = BigInt(String(issued.body.expiry));
+  const fields = { registry: REGISTRY_ADDRESS, boardId: DEMO_BOARD, guest: toHex(who.account), botNonce, expiry };
+  // The browser's own check of the expiry against the latest block is core's to test; here the
+  // request is signed whenever the scheduler lets it, and the bot decides whether it is in time.
+  const signedBy = (key: Uint8Array): Uint8Array => signLeave(key, { ...fields, latestBlockTimestamp: expiry - 1n }).signature;
+  const everyone = signersOf(w);
+  const other = everyone[(everyone.indexOf(who) + 1) % everyone.length] as Identity;
+  const signature = kind === "wrongSigner" ? signedBy(other.mldsa.secretKey) : kind === "joinBytes" ? signAction(who.mldsa.secretKey, challengeMessage(fields)) : signedBy(who.mldsa.secretKey);
+  const sent: LeaveSent = { kind: "leave", body: { guest: who.evm, botNonce, expiry: expiry.toString(), signature: bytesToHex(signature) }, ip: from, account: who.evm, valid: kind === "valid", nonce: botNonce, asJoin: kind === "asJoin" };
+  h.history.push(sent);
+  await sendLeave(h, sent, kind);
+}
+
+/** One leave request, recorded with the request that carried it, so a removal handed over while it ran can be laid against what it was. */
+async function sendLeave(h: Harness, sent: LeaveSent, how: string): Promise<void> {
+  const w = h.world;
+  const flow = w.flow()?.id;
+  if (flow !== undefined) h.leaveFlows.set(flow, { account: sent.account, valid: sent.valid, nonce: sent.nonce });
+  const logFrom = w.store.log.length;
+  const answer = sent.asJoin
+    ? await answerOf(await guarded("handleDemoJoin", () => handleDemoJoin(appRequest("/api/demo/join", sent.body), w.demoContext(sent.ip))))
+    : await answerOf(await guarded("handleDemoLeave", () => handleDemoLeave(appRequest("/api/demo/leave", sent.body), w.demoContext(sent.ip))));
+  h.leaves.push({ seq: w.seq, account: sent.account, how, asJoin: sent.asJoin, status: answer.status, error: answer.error, flow, concurrent: w.scheduler !== undefined, logFrom });
+  h.answers.push(`leave ${sent.account.slice(0, 10)} ${how}: ${answer.status} ${answer.error ?? ""}`);
+}
+
+function demoLeave(pick: number, seated: boolean, kind: LeaveKind, ip: number, chaos: Chaos): Step {
+  const name = named("leave", [`pick=${pick}`, seated ? "seated" : "", kind, `ip=${ip}`, chaosText(chaos)]);
+  return command(name, (h) => step(h, "leave", name, chaos, () => leaveFlow(h, leaverOf(h, pick, seated), kind, ip)));
+}
+
 /** Members whose KEM lookup fails for one command, picked by position on the board as it stands. */
 function unreadableOf(h: Harness, pick: number | null): Hex[] {
   if (pick === null) return [];
@@ -359,13 +481,29 @@ async function pressureFlow(h: Harness): Promise<void> {
     h.answers.push("pressure: nothing scheduled");
     return;
   }
-  const outcome = (await guarded("freeDemoSeats", work)) as PressureOutcome;
-  h.answers.push(`pressure: removed ${outcome.removed.length}, stopped ${plain(outcome.stopped)}`);
+  // A join's work is a pass followed by a pack check, or, after an admitted join with no pass due, the pack check alone.
+  const outcome = (await guarded("background work", work)) as (PressureOutcome & { pack?: PackOutcome }) | PackOutcome;
+  if (!("removed" in outcome)) {
+    h.answers.push(`pressure: pack ${plain(outcome)}`);
+    return;
+  }
+  h.answers.push(`pressure: removed ${outcome.removed.length}, stopped ${plain(outcome.stopped)}${outcome.pack === undefined ? "" : `, pack ${plain(outcome.pack)}`}`);
 }
 
 function pressurePass(unreadable: number | null, chaos: Chaos): Step {
   const name = named("pressure", [unreadable === null ? "" : `unreadable=${unreadable}`, chaosText(chaos)]);
   return command(name, (h) => step(h, "pressure", name, { ...chaos, unreadable: unreadableOf(h, unreadable) }, () => pressureFlow(h)));
+}
+
+/** The bot's own check that the demo board's current epoch has its pack, posting it when it has none. */
+async function packFlow(h: Harness): Promise<void> {
+  const outcome = await guarded("ensureCurrentPack", () => ensureCurrentPack(h.world.sweepContext()));
+  h.answers.push(`pack: ${plain(outcome)}`);
+}
+
+function packRun(chaos: Chaos): Step {
+  const name = named("pack", [chaosText(chaos)]);
+  return command(name, (h) => step(h, "pack", name, chaos, () => packFlow(h)));
 }
 
 /** Refusals that stop the demo sweep before it settles the marks a join left: the lock, the board read, the chair check. */
@@ -534,8 +672,10 @@ function foreignTx(throughWindow: boolean): Step {
 export type Part =
   | { kind: "relay"; how: "fresh" | "copy" | "resign"; board: number; pick: number; ip: number }
   | { kind: "join"; guest: number; ip: number }
+  | { kind: "leave"; pick: number; ip: number }
   | { kind: "pressure" }
   | { kind: "sweep" }
+  | { kind: "pack" }
   | { kind: "clock"; seconds: number; after: number };
 
 function partText(p: Part): string {
@@ -544,6 +684,8 @@ function partText(p: Part): string {
       return `relay ${p.how} ${p.how === "fresh" ? `board=${PUBLIC_BOARDS[p.board]}` : `pick=${p.pick}`} ip=${p.ip}`;
     case "join":
       return `join guest=${p.guest} ip=${p.ip}`;
+    case "leave":
+      return `leave pick=${p.pick} ip=${p.ip}`;
     case "clock":
       return `clock +${p.seconds}s after ${p.after} turns`;
     default:
@@ -582,10 +724,17 @@ function preparePart(h: Harness, p: Part): () => Promise<void> {
     }
     case "join":
       return () => joinFlow(h, p.guest, "valid", p.ip);
+    case "leave": {
+      // Picked now, so two leaves with one pick name one seat and meet at its one leave request.
+      const who = leaverOf(h, p.pick, true);
+      return () => leaveFlow(h, who, "valid", p.ip);
+    }
     case "pressure":
       return () => pressureFlow(h);
     case "sweep":
       return () => sweepFlow(h);
+    case "pack":
+      return () => packFlow(h);
     case "clock":
       return async () => {
         for (let i = 0; i < p.after; i++) await w.turn("clock");
@@ -616,8 +765,8 @@ function scheduleText(s: fc.Scheduler): string {
 /**
  * Two or three requests at once. The scheduler, drawn from `seed`, picks which waiting step goes
  * next at every store call, chain call and wait, so races the one-at-a-time commands never reach
- * are reached here: two joins of one guest, a join behind a pass that holds demo:join, two relays at
- * one nonce, a mark taken back while another relay claims it, a lock that runs out under its holder.
+ * are reached here: two joins of one guest, a join behind a pass that holds demo:join, two leaves of
+ * one seat on one leave request, a leave beside a sweep or a join, two relays at one nonce, a mark taken back while another relay claims it, a lock that runs out under its holder.
  */
 function overlapRun(seed: number, parts: readonly Part[], chaos: Chaos): Step {
   const name = named("overlap", [`[${parts.map(partText).join(" | ")}]`, `seed=${seed}`, chaosText(chaos)]);
@@ -667,6 +816,9 @@ const guestArb = fc.integer({ min: 0, max: 5 });
 const unreadableArb = fc.oneof({ arbitrary: fc.constant(null), weight: 6 }, { arbitrary: fc.nat(40), weight: 1 });
 
 const joinKindArb = fc.oneof({ arbitrary: fc.constant<JoinKind>("valid"), weight: 4 }, { arbitrary: fc.constantFrom<JoinKind>("noKem", "copied", "unreadable"), weight: 1 });
+/** Six guests, three members seated before the run, the chair and the two seeded directors. */
+const leaverArb = fc.integer({ min: 0, max: 11 });
+const leaveKindArb = fc.oneof({ arbitrary: fc.constant<LeaveKind>("valid"), weight: 5 }, { arbitrary: fc.constantFrom<LeaveKind>("wrongSigner", "joinBytes", "joinNonce", "asJoin"), weight: 4 });
 const documentArb = fc
   .tuple(
     ipArb,
@@ -693,8 +845,10 @@ const clockPartArb: fc.Arbitrary<Part> = fc.record({ kind: fc.constant("clock" a
 const anyPartArb: fc.Arbitrary<Part> = fc.oneof(
   relayPartArb,
   fc.record({ kind: fc.constant("join" as const), guest: guestArb, ip: ipArb }),
+  fc.record({ kind: fc.constant("leave" as const), pick: leaverArb, ip: ipArb }),
   fc.constant<Part>({ kind: "pressure" }),
   fc.constant<Part>({ kind: "sweep" }),
+  fc.constant<Part>({ kind: "pack" }),
   clockPartArb,
 );
 /** The races the order asks for by name, then any two or three requests at all. */
@@ -715,6 +869,15 @@ const partsArb: fc.Arbitrary<Part[]> = fc.oneof(
   fc
     .tuple(guestArb, ipArb, fc.constantFrom<"pressure" | "sweep">("pressure", "sweep"), fc.option(clockPartArb, { nil: undefined }))
     .map(([guest, ip, holder, clock]): Part[] => [{ kind: holder }, { kind: "join", guest, ip }, ...(clock === undefined ? [] : [clock])]),
+  // Two leaves of one seat: both are handed the one live leave request, and only one may use it.
+  fc.tuple(leaverArb, ipArb, ipArb).map(([pick, a, b]): Part[] => [
+    { kind: "leave", pick, ip: a },
+    { kind: "leave", pick, ip: b },
+  ]),
+  // A leave beside whatever else takes the board's lock: a sweep, a pass, a pack check or a join.
+  fc
+    .tuple(leaverArb, ipArb, fc.oneof(fc.constantFrom<Part>({ kind: "pressure" }, { kind: "sweep" }, { kind: "pack" }), fc.record({ kind: fc.constant("join" as const), guest: guestArb, ip: ipArb })), fc.option(clockPartArb, { nil: undefined }))
+    .map(([pick, ip, beside, clock]): Part[] => [beside, { kind: "leave", pick, ip }, ...(clock === undefined ? [] : [clock])]),
   fc
     .tuple(boardArb, fc.nat(3), fc.array(fc.tuple(relayHowArb, ipArb), { minLength: 2, maxLength: 3 }))
     .map(([board, pick, hows]): Part[] => hows.map(([how, ip]) => ({ kind: "relay", how, board, pick, ip }))),
@@ -734,8 +897,10 @@ export const commandArbs: fc.Arbitrary<Step>[] = [
     { weight: 6, arbitrary: fc.tuple(fc.nat(), chaosArb).map(([p, c]) => clientRetry(p, c)) },
     { weight: 3, arbitrary: fc.tuple(guestArb, ipArb).map(([g, ip]) => demoChallenge(g, ip)) },
     { weight: 15, arbitrary: fc.tuple(guestArb, joinKindArb, ipArb, chaosArb).map(([g, k, ip, c]) => demoJoin(g, k, ip, c)) },
+    { weight: 9, arbitrary: fc.tuple(leaverArb, fc.boolean(), leaveKindArb, ipArb, chaosArb).map(([p, seated, k, ip, c]) => demoLeave(p, seated, k, ip, c)) },
     { weight: 6, arbitrary: fc.tuple(unreadableArb, chaosArb).map(([u, c]) => pressurePass(u, c)) },
     { weight: 6, arbitrary: fc.tuple(unreadableArb, chaosArb).map(([u, c]) => scheduledSweep(u, c)) },
+    { weight: 4, arbitrary: chaosArb.map((c) => packRun(c)) },
     { weight: 9, arbitrary: documentArb },
     { weight: 6, arbitrary: clockArb },
     { weight: 9, arbitrary: fc.constantFrom<"mine" | "lose" | "revert">("mine", "mine", "lose", "revert").map((how) => chainSettles(how)) },
@@ -748,7 +913,9 @@ export const commandArbs: fc.Arbitrary<Step>[] = [
 /**
  * The starting state of one run. Half the runs start with the demo board a few seats from full,
  * where pressure passes and board_full live, and a third of all runs one seat short of the cap,
- * where a join can meet a board another join filled while it waited for the lock.
+ * where a join can meet a board another join filled while it waited for the lock. Half start with
+ * the seed's pack for the board's epoch and half with none, so the bot's first pack is for the
+ * seed epoch itself.
  */
 export const worldInitArb: fc.Arbitrary<WorldInit> = fc.record({
   fillers: fc.oneof(fc.integer({ min: 0, max: 6 }), fc.integer({ min: 30, max: 36 }), fc.constant(DEMO_GUEST_CAP - 4)),
@@ -756,4 +923,5 @@ export const worldInitArb: fc.Arbitrary<WorldInit> = fc.record({
   tightLimits: fc.boolean(),
   demoRelaysPerHour: fc.oneof({ weight: 3, arbitrary: fc.constant(120) }, { weight: 1, arbitrary: fc.constant(3) }),
   preSpend: fc.constantFrom<WorldInit["preSpend"]>(0, 0.5, 0.97),
+  seedPack: fc.boolean(),
 });

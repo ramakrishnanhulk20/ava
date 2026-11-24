@@ -259,6 +259,13 @@ export const DEMO_CHALLENGE_LIMITS = { perIp: 10, total: 1_000, windowSeconds: 3
  * the lock always outlives the work. The relay inside keeps its own 55 s budget (RELAY_DEADLINE_MS),
  * so a relay starts only while that much is left, by 65 s; later the bot refuses with out_of_time.
  */
+/**
+ * Leave requests per IP per hour (threat model C47). A leave needs the guest's own signature and a
+ * seat on the board, and each address is admitted once, so this only bounds how often one caller can
+ * make the bot read the board.
+ */
+export const DEMO_LEAVE_LIMITS = { perIp: 3, windowSeconds: 3600 } as const;
+
 export const DEMO_DEADLINE_MS = 120_000;
 export const DEMO_RELAY_CUTOFF_MS = DEMO_DEADLINE_MS - RELAY_DEADLINE_MS;
 export const DEMO_LOCK_TTL_SECONDS = 150;

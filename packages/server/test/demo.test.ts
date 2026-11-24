@@ -8,14 +8,19 @@ import {
   KemKeyUnavailable,
   Mode,
   actionMessage,
+  challengeMessage,
+  decryptDocument,
   generateMnemonic,
   identityFromMnemonic,
+  leaveMessage,
   newEpochKey,
   openEpochKey,
   paramsAdd,
+  paramsPost,
   sealEpochKey,
   sha256,
   signAction,
+  signLeave,
   toHex,
   verifyAction,
   type Identity,
@@ -31,7 +36,20 @@ import { MemoryBlobBackend, handleUpload } from "../src/blob.ts";
 import { NotBroadcast } from "../src/chain/evm.ts";
 import type { EvmSend, RelayChain, TxRequest } from "../src/chain/types.ts";
 import { DEMO_FREE_SEATS, DEMO_GUEST_CAP, DEMO_RELAYS_PER_HOUR, REGISTRY_ADDRESS, REGISTRY_CODE_KECCAK, WINDOW } from "../src/config.ts";
-import { admittedKey, challengeKey, freeDemoSeats, handleDemoChallenge, handleDemoJoin, sweepDemoGuests, type DemoContext } from "../src/demo.ts";
+import {
+  admittedKey,
+  challengeKey,
+  ensureCurrentPack,
+  freeDemoSeats,
+  handleDemoChallenge,
+  handleDemoJoin,
+  handleDemoLeave,
+  handleDemoLeaveChallenge,
+  leaveKey,
+  sweepDemoGuests,
+  type DemoContext,
+} from "../src/demo.ts";
+import { DEMO_PACK_TEXT } from "../src/demoPack.ts";
 import type { BoardSnapshot, DemoChain, Grant, KeyStatus } from "../src/demoBoard.ts";
 import { loadEnv } from "../src/env.ts";
 import { handleRelay, reserveDemoRelays } from "../src/relay.ts";
@@ -112,9 +130,11 @@ interface BoardState {
   nonce: bigint;
   members: Hex[];
   grants: Grant[];
+  documentCount: number;
+  latestDocumentEpoch: bigint | undefined;
 }
 
-/** A board whose current epoch's envelope is sealed to every member, stored where the bot looks for it. */
+/** A board whose current epoch's envelope is sealed to every member, stored where the bot looks for it, with that epoch's pack already posted. */
 async function seededBoard(blobs: MemoryBlobBackend, members: Member[]): Promise<{ state: BoardState; epochKey: Uint8Array }> {
   const boardRef = bytesToHex(globalThis.crypto.getRandomValues(new Uint8Array(32)));
   const epoch = 3n;
@@ -123,7 +143,7 @@ async function seededBoard(blobs: MemoryBlobBackend, members: Member[]): Promise
   const envelopeHash = bytesToHex(sha256(envelope));
   await blobs.put(`envelope/${envelopeHash.slice(2)}`, envelope);
   return {
-    state: { boardRef, epoch, nonce: 11n, members: members.map((m) => m.evm), grants: [{ envelopeHash, envelopeSize: envelope.length, mode: Mode.ROTATE, member: ZERO }] },
+    state: { boardRef, epoch, nonce: 11n, members: members.map((m) => m.evm), grants: [{ envelopeHash, envelopeSize: envelope.length, mode: Mode.ROTATE, member: ZERO }], documentCount: 1, latestDocumentEpoch: epoch },
     epochKey: Uint8Array.from(epochKey),
   };
 }
@@ -216,7 +236,7 @@ function relayChain(board?: BoardState) {
   return { chain, sends, preflights };
 }
 
-/** What the registry does with the bot's own removeMember and addMember once they land. */
+/** What the registry does with the bot's own removeMember, addMember and postDocument once they land. */
 function land(board: BoardState, tx: EvmSend): void {
   const decoded = decodeFunctionData({ abi: boardRegistryAbi, data: tx.data });
   if (decoded.functionName === "removeMember") {
@@ -231,6 +251,10 @@ function land(board: BoardState, tx: EvmSend): void {
   if (decoded.functionName === "addMember") {
     const [, member, mode, envelopeHash, envelopeSize] = decoded.args as unknown as readonly [bigint, Hex, number, Hex, number];
     Object.assign(board, { nonce: board.nonce + 1n, members: [...board.members, member], grants: [...board.grants, { envelopeHash, envelopeSize, mode, member }] });
+  }
+  if (decoded.functionName === "postDocument") {
+    const [, , , , epoch] = decoded.args as unknown as readonly [bigint, Hex, Hex, bigint, bigint];
+    Object.assign(board, { nonce: board.nonce + 1n, documentCount: board.documentCount + 1, latestDocumentEpoch: epoch });
   }
 }
 
@@ -324,6 +348,24 @@ function addMemberArgs(send: EvmSend) {
   expect(decoded.functionName).toBe("addMember");
   const [boardId, member, mode, envelopeHash, envelopeSize, epochAfter, deadline, signature] = decoded.args as unknown as readonly [bigint, Hex, number, Hex, number, bigint, bigint, Hex];
   return { boardId, member, mode, envelopeHash, envelopeSize, epochAfter, deadline, signature };
+}
+
+/** The bytes the bot encrypts for every pack it posts. */
+const PACK = new TextEncoder().encode(DEMO_PACK_TEXT);
+
+function postArgs(send: EvmSend) {
+  const decoded = decodeFunctionData({ abi: boardRegistryAbi, data: send.data });
+  expect(decoded.functionName).toBe("postDocument");
+  const [boardId, docRef, cipherHash, cipherSize, epoch, deadline, signature] = decoded.args as unknown as readonly [bigint, Hex, Hex, bigint, bigint, bigint, Hex];
+  return { boardId, docRef, cipherHash, cipherSize, epoch, deadline, signature };
+}
+
+/** A posted pack opened as a member opens it: the epoch key from a grant sealed to that member, then the document the post names. */
+async function readPack(blobs: MemoryBlobBackend, boardRef: Hex, grant: Grant, keys: Member["seal"], posted: ReturnType<typeof postArgs>): Promise<Uint8Array> {
+  const envelope = (await blobs.read(new URL(`${ORIGIN}/envelope/${grant.envelopeHash.slice(2)}`), grant.envelopeSize)) as Uint8Array;
+  const epochKey = openEpochKey({ registry: REGISTRY_ADDRESS, boardRef, epoch: posted.epoch, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: keys });
+  const ciphertext = (await blobs.read(new URL(`${ORIGIN}/document/${posted.cipherHash.slice(2)}`), Number(posted.cipherSize))) as Uint8Array;
+  return decryptDocument({ epochKey, registry: REGISTRY_ADDRESS, boardRef, epoch: posted.epoch, docRef: posted.docRef, ciphertext, expectedHash: posted.cipherHash, expectedSize: posted.cipherSize });
 }
 
 describe("handleDemoChallenge", () => {
@@ -519,10 +561,10 @@ describe("handleDemoJoin", () => {
 
     await scheduled[0]?.();
     expect(await answer(await join(ctx, body))).toMatchObject({ status: 202 });
-    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "addMember"]);
+    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "postDocument", "addMember"]);
   });
 
-  it("admits a join at 34 members with one relay and schedules a pressure pass, which brings the board back to 34; a join at 33 schedules none", async () => {
+  it("admits a join at 34 members with one relay and schedules a pressure pass, which brings the board back to 34; a join at 33 schedules no pass, only the pack check", async () => {
     expect(DEMO_GUEST_CAP - DEMO_FREE_SEATS).toBe(34);
     const at34 = await boardOf(DEMO_GUEST_CAP - DEMO_FREE_SEATS);
     const { scheduled, background } = collector();
@@ -543,7 +585,9 @@ describe("handleDemoJoin", () => {
     at33.ctx.background = quiet.background;
     expect((await join(at33.ctx, joinBody(g1, await challengeFor(at33.ctx, g1)))).status).toBe(202);
     expect(at33.state.members).toHaveLength(34);
-    expect(quiet.scheduled).toHaveLength(0);
+    expect(quiet.scheduled).toHaveLength(1);
+    expect(await quiet.scheduled[0]?.()).toEqual({ done: "current" });
+    expect(calls(at33.relay.sends)).toEqual(["addMember"]);
   });
 
   it("seats a judge who met a full board once the pass it scheduled has freed seats, by the sweep's own removal, sealing the new epoch away from the guest removed", async () => {
@@ -556,7 +600,7 @@ describe("handleDemoJoin", () => {
     expect(await answer(await join(ctx, joinBody(g1, await challengeFor(ctx, g1))))).toEqual({ status: 503, body: { error: "board_full" } });
     expect(relay.sends).toHaveLength(0);
     await scheduled[0]?.();
-    expect(calls(relay.sends)).toEqual(Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"));
+    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "postDocument"]);
     const removal = decodeFunctionData({ abi: boardRegistryAbi, data: (relay.sends[0] as EvmSend).data }).args as unknown as readonly [bigint, Hex, Hex, number, bigint];
     expect([removal[1], removal[4]]).toEqual([oldest.evm, 4n]);
     const sealed = (await blobs.read(new URL(`${ORIGIN}/envelope/${removal[2].slice(2)}`), removal[3])) as Uint8Array;
@@ -566,7 +610,7 @@ describe("handleDemoJoin", () => {
 
     // The judge's retry, on a fresh challenge, is one addMember.
     expect((await join(ctx, joinBody(g1, await challengeFor(ctx, g1)))).status).toBe(202);
-    expect(calls(relay.sends).slice(DEMO_FREE_SEATS)).toEqual(["addMember"]);
+    expect(calls(relay.sends).slice(DEMO_FREE_SEATS + 1)).toEqual(["addMember"]);
     expect(state.members).toHaveLength(DEMO_GUEST_CAP - DEMO_FREE_SEATS + 1);
     expect(state.members).toContain(g1.evm);
     expect(state.members).not.toContain(oldest.evm);
@@ -588,9 +632,9 @@ describe("handleDemoJoin", () => {
     expect(await answer(await join(ctx, joinBody(g1, await challengeFor(ctx, g1))))).toEqual({ status: 503, body: { error: "board_full" } });
     await scheduled[0]?.();
     expect((await join(ctx, joinBody(g1, await challengeFor(ctx, g1)))).status).toBe(202);
-    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "addMember"]);
+    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "postDocument", "addMember"]);
     expect(state.members).toContain(g1.evm);
-    // The IP still has exactly one of its 20 left on each: the bot's seven relays and seven uploads took none.
+    // The IP still has exactly one of its 20 left on each: the bot's eight relays and seven envelope uploads took none.
     expect((await junkRelay()).status).toBe(400);
     expect((await junkRelay()).status).toBe(429);
     expect((await junkUpload()).status).toBe(400);
@@ -1015,13 +1059,13 @@ describe("handleDemoJoin", () => {
 
 describe("sweepDemoGuests", () => {
   it("removes only the oldest expired guest per call and never the chair or a seeded director", async () => {
-    const { ctx, state, store, relay, blobs } = await setup({ members: [chair, asha, ben, g1, g2, g3, g4] });
+    const { ctx, state, store, relay, blobs } = await setup({ members: [chair, asha, ben, g1, g2, g3, g4], landSends: true });
     const at = (who: Identity, hoursAgo: number) => store.setIfAbsent(admittedKey(who.account), String(NOW - hoursAgo * HOUR), 86_400);
     await Promise.all([at(chair, 10), at(asha, 10), at(g2, 6.5), at(g1, 7), at(g3, 1)]);
 
     const first = await sweepDemoGuests(ctx);
     expect(first).toMatchObject({ done: "removed", member: g1.evm, epochAfter: "4", landed: true });
-    expect(relay.sends).toHaveLength(1);
+    expect(calls(relay.sends)).toEqual(["removeMember", "postDocument"]);
     const decoded = decodeFunctionData({ abi: boardRegistryAbi, data: (relay.sends[0] as EvmSend).data });
     expect(decoded.functionName).toBe("removeMember");
     const [boardId, member, envelopeHash, envelopeSize, epochAfter] = decoded.args as unknown as readonly [bigint, Hex, Hex, number, bigint];
@@ -1032,13 +1076,13 @@ describe("sweepDemoGuests", () => {
     for (const who of [asha, ben, g2, g3, g4]) expect(open(who)).toEqual(fresh);
     expect(codeOf(() => open(g1))).toBe("NOT_A_RECIPIENT");
 
-    // The removal lands: the board moves to epoch 4 without g1.
-    Object.assign(state, { epoch: 4n, nonce: state.nonce + 1n, members: state.members.filter((m) => m !== g1.evm), grants: [{ envelopeHash, envelopeSize, mode: Mode.ROTATE, member: ZERO }] });
+    // The removal landed: the board is at epoch 4 without g1.
+    expect(state).toMatchObject({ epoch: 4n, grants: [{ envelopeHash, envelopeSize, mode: Mode.ROTATE, member: ZERO }] });
+    expect(state.members).not.toContain(g1.evm);
     expect(await sweepDemoGuests(ctx)).toMatchObject({ done: "removed", member: g2.evm, epochAfter: "5" });
-    Object.assign(state, { epoch: 5n, nonce: state.nonce + 1n, members: state.members.filter((m) => m !== g2.evm) });
 
     expect(await sweepDemoGuests(ctx)).toEqual({ done: "nothing_due", guests: 2, unknown: 0 });
-    expect(relay.sends).toHaveLength(2);
+    expect(calls(relay.sends)).toEqual(["removeMember", "postDocument", "removeMember", "postDocument"]);
   });
 
   it("frees seats on a full board with no background runner: after its own expiry step it runs the pressure pass down to 34, so a judge's retry is seated", async () => {
@@ -1057,7 +1101,7 @@ describe("sweepDemoGuests", () => {
     expect(await sweepDemoGuests(ctx)).toMatchObject({ done: "nothing_due", guests: DEMO_GUEST_CAP - DEMO_FREE_SEATS - 2, pressure: { removed: [{ reason: "pressure" }], stopped: { done: "room" } } });
     expect(await sweepDemoGuests(ctx)).toEqual({ done: "nothing_due", guests: DEMO_GUEST_CAP - DEMO_FREE_SEATS - 3, unknown: 0 });
     expect(state.members).toHaveLength(DEMO_GUEST_CAP - DEMO_FREE_SEATS);
-    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "addMember", "removeMember"]);
+    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "postDocument", "addMember", "removeMember", "postDocument"]);
   });
 
   it("removes no one when the hour has no demo relay left, and answers demo_busy", async () => {
@@ -1312,9 +1356,10 @@ describe("freeDemoSeats: the pressure pass", () => {
     expect(scheduled).toHaveLength(1);
 
     const oldest = guests.at(-1) as Member;
-    expect(await scheduled[0]?.()).toMatchObject({ removed: [{ member: oldest.evm, reason: "pressure", landed: true }], stopped: { done: "room" } });
+    expect(await scheduled[0]?.()).toMatchObject({ removed: [{ member: oldest.evm, reason: "pressure", landed: true }], stopped: { done: "room" }, pack: { done: "posted", epoch: 4n } });
     expect(state.members).toHaveLength(DEMO_GUEST_CAP - DEMO_FREE_SEATS);
-    expect(await hourLeft(store, passAt)).toBe(DEMO_RELAYS_PER_HOUR - 1);
+    // The pass's one removal and the pack's post.
+    expect(await hourLeft(store, passAt)).toBe(DEMO_RELAYS_PER_HOUR - 2);
   });
 
   it("still removes a guest whose ML-KEM key is gone first, whatever its age, then the oldest", async () => {
@@ -1330,6 +1375,134 @@ describe("freeDemoSeats: the pressure pass", () => {
         .map((g) => [g.evm, "pressure"]),
     ]);
     expect(state.members).toHaveLength(DEMO_GUEST_CAP - DEMO_FREE_SEATS);
+  });
+});
+
+describe("ensureCurrentPack: the demo pack", () => {
+  it("posts the pack once for a current epoch that has none, so a guest admitted at that epoch opens it to the pack text's bytes", async () => {
+    const { ctx, state, store, relay, blobs } = await setup({ landSends: true });
+    // The board's packs are all from the epoch before, so none is for the epoch a judge joins at.
+    Object.assign(state, { documentCount: 3, latestDocumentEpoch: state.epoch - 1n });
+    expect((await join(ctx, joinBody(g1, await challengeFor(ctx, g1)))).status).toBe(202);
+    const nonce = state.nonce;
+
+    expect(await ensureCurrentPack(ctx)).toEqual({ done: "posted", txHash: expect.stringMatching(/^0x[0-9a-f]{64}$/), epoch: 3n });
+    expect(calls(relay.sends)).toEqual(["addMember", "postDocument"]);
+    const posted = postArgs(relay.sends[1] as EvmSend);
+    expect(posted).toMatchObject({ boardId: BOARD_ID, epoch: 3n, cipherSize: BigInt(12 + PACK.length + 16), deadline: BigInt(NOW / 1000 + 600) });
+    // The relay posts a document only at the size its verified mark holds.
+    expect(await store.get(`verified:${posted.cipherHash.slice(2)}`)).toBe(posted.cipherSize.toString());
+    const message = actionMessage({ registry: REGISTRY_ADDRESS, action: Action.POST, boardId: BOARD_ID, paramsHash: paramsPost(posted), nonce, deadline: posted.deadline });
+    expect(verifyAction(chair.mldsa.publicKey, message, hexToBytes(posted.signature))).toBe(true);
+    expect(state).toMatchObject({ documentCount: 4, latestDocumentEpoch: 3n });
+
+    const own = state.grants.find((g) => g.member === g1.evm) as Grant;
+    const read = await readPack(blobs, state.boardRef, own, g1.seal, posted);
+    expect(read).toEqual(PACK);
+    expect(new TextDecoder().decode(read).split("\n")[0]).toBe("Ava demo board: board pack");
+    expect(await readPack(blobs, state.boardRef, state.grants[0] as Grant, asha.seal, posted)).toEqual(PACK);
+    await expect(readPack(blobs, state.boardRef, own, g2.seal, posted)).rejects.toMatchObject({ code: "NOT_A_RECIPIENT" });
+  });
+
+  it("refuses pack_unavailable, touching nothing, when the pack text is empty", async () => {
+    vi.resetModules();
+    vi.doMock("../src/demoPack.ts", () => ({ DEMO_PACK_TEXT: "" }));
+    try {
+      const fresh = await import("../src/demo.ts");
+      const { ctx, state, untouched } = await setup({ landSends: true });
+      Object.assign(state, { documentCount: 0, latestDocumentEpoch: undefined });
+      expect(await fresh.ensureCurrentPack(ctx)).toEqual({ done: "refused", reason: "pack_unavailable" });
+      expect(untouched()).toBe(true);
+    } finally {
+      vi.doUnmock("../src/demoPack.ts");
+      vi.resetModules();
+    }
+  });
+
+  it("posts nothing, reserves nothing and reads no envelope when the current epoch already has a pack", async () => {
+    const { ctx, store, untouched } = await setup();
+    expect(await ensureCurrentPack(ctx)).toEqual({ done: "current" });
+    expect(untouched()).toBe(true);
+    expect(await hourLeft(store)).toBe(DEMO_RELAYS_PER_HOUR);
+  });
+
+  it("posts once when two runs race for the same epoch: the second waits for the lock and finds the first one's pack", async () => {
+    const { ctx, state, relay } = await setup({ landSends: true });
+    Object.assign(state, { documentCount: 0, latestDocumentEpoch: undefined });
+    const outcomes = await Promise.all([ensureCurrentPack(ctx), ensureCurrentPack(ctx)]);
+    expect(outcomes.map((o) => o.done).sort()).toEqual(["current", "posted"]);
+    expect(calls(relay.sends)).toEqual(["postDocument"]);
+    expect(state).toMatchObject({ documentCount: 1, latestDocumentEpoch: 3n });
+  });
+
+  it("answers refused demo_busy when the hour has no demo relay left, and stores, signs and changes nothing", async () => {
+    const { ctx, state, store, untouched } = await setup({ landSends: true });
+    Object.assign(state, { documentCount: 0, latestDocumentEpoch: undefined });
+    for (let n = 0; n < DEMO_RELAYS_PER_HOUR; n++) expect(await reserveDemoRelays(store, NOW, 1)).toBe(true);
+    const before = structuredClone(state);
+    expect(await ensureCurrentPack(ctx)).toEqual({ done: "refused", reason: "demo_busy" });
+    expect(untouched()).toBe(true);
+    expect(state).toEqual(before);
+    // The next clock hour has room, and the pack goes out then.
+    expect(await ensureCurrentPack({ ...ctx, wallClock: () => NOW + HOUR })).toMatchObject({ done: "posted", epoch: 3n });
+  });
+
+  it("follows a join's pressure pass, which moved the epoch six times, with one post for the final epoch that every guest left on the board can open", async () => {
+    const { ctx, state, relay, blobs, guests } = await boardOf(DEMO_GUEST_CAP);
+    const { scheduled, background } = collector();
+    ctx.background = background;
+    expect(await answer(await join(ctx, joinBody(g1, await challengeFor(ctx, g1))))).toEqual({ status: 503, body: { error: "board_full" } });
+    expect(scheduled).toHaveLength(1);
+
+    const final = 3n + BigInt(DEMO_FREE_SEATS);
+    expect(await scheduled[0]?.()).toMatchObject({ stopped: { done: "limit" }, pack: { done: "posted", epoch: final } });
+    expect(calls(relay.sends)).toEqual([...Array.from({ length: DEMO_FREE_SEATS }, () => "removeMember"), "postDocument"]);
+    const posted = postArgs(relay.sends.at(-1) as EvmSend);
+    expect(posted.epoch).toBe(final);
+    const rotation = state.grants[0] as Grant;
+    for (const guest of guests.slice(0, -DEMO_FREE_SEATS)) expect(await readPack(blobs, state.boardRef, rotation, guest.seal, posted)).toEqual(PACK);
+    await expect(readPack(blobs, state.boardRef, rotation, (guests.at(-1) as Member).seal, posted)).rejects.toMatchObject({ code: "NOT_A_RECIPIENT" });
+    expect(await ensureCurrentPack(ctx)).toEqual({ done: "current" });
+    expect(relay.sends).toHaveLength(DEMO_FREE_SEATS + 1);
+  });
+
+  it("follows every admitted join with it in the background, so a guest joining a quiet board whose epoch has no pack gets one post it opens, and the next guest none", async () => {
+    // Twenty members, far from the pressure threshold, and the newest pack is from an earlier epoch.
+    const { ctx, state, relay, blobs } = await boardOf(20);
+    Object.assign(state, { documentCount: 3, latestDocumentEpoch: state.epoch - 1n });
+    const { scheduled, background } = collector();
+    ctx.background = background;
+    expect((await join(ctx, joinBody(g1, await challengeFor(ctx, g1)))).status).toBe(202);
+    expect(scheduled).toHaveLength(1);
+    expect(await scheduled[0]?.()).toEqual({ done: "posted", txHash: expect.stringMatching(/^0x[0-9a-f]{64}$/), epoch: 3n });
+    expect(calls(relay.sends)).toEqual(["addMember", "postDocument"]);
+    const own = state.grants.find((g) => g.member === g1.evm) as Grant;
+    expect(await readPack(blobs, state.boardRef, own, g1.seal, postArgs(relay.sends[1] as EvmSend))).toEqual(PACK);
+
+    expect((await join(ctx, joinBody(g2, await challengeFor(ctx, g2)))).status).toBe(202);
+    expect(scheduled).toHaveLength(2);
+    expect(await scheduled[1]?.()).toEqual({ done: "current" });
+    expect(calls(relay.sends)).toEqual(["addMember", "postDocument", "addMember"]);
+  });
+
+  it("ends every scheduled sweep: a sweep whose removal moved the epoch posts that epoch's pack, and one with nothing new to seal posts nothing", async () => {
+    const { ctx, state, store, relay, blobs } = await setup({ members: [chair, asha, ben, g1, g2], landSends: true });
+    await store.setIfAbsent(admittedKey(g1.account), String(NOW - 7 * HOUR), 86_400);
+    await store.setIfAbsent(admittedKey(g2.account), String(NOW - HOUR), 86_400);
+
+    const swept = await sweepDemoGuests(ctx);
+    expect(swept).toMatchObject({ done: "removed", member: g1.evm, epochAfter: "4", landed: true, pack: { done: "posted", epoch: 4n } });
+    expect(calls(relay.sends)).toEqual(["removeMember", "postDocument"]);
+    const posted = postArgs(relay.sends[1] as EvmSend);
+    expect(await readPack(blobs, state.boardRef, state.grants[0] as Grant, g2.seal, posted)).toEqual(PACK);
+    await expect(readPack(blobs, state.boardRef, state.grants[0] as Grant, g1.seal, posted)).rejects.toMatchObject({ code: "NOT_A_RECIPIENT" });
+
+    expect(await sweepDemoGuests(ctx)).toEqual({ done: "nothing_due", guests: 1, unknown: 0 });
+    expect(relay.sends).toHaveLength(2);
+    // An epoch left with no pack, though no one is due, gets one from the next sweep.
+    Object.assign(state, { documentCount: 0, latestDocumentEpoch: undefined });
+    expect(await sweepDemoGuests(ctx)).toMatchObject({ done: "nothing_due", pack: { done: "posted", epoch: 4n } });
+    expect(calls(relay.sends)).toEqual(["removeMember", "postDocument", "postDocument"]);
   });
 });
 
@@ -1376,5 +1549,188 @@ describe("demo settings", () => {
     for (const bad of [`${asha.evm},`, `${asha.evm},${asha.qor1}`, "qor1nope", `${asha.evm};${ben.evm}`]) {
       expect(() => loadEnv({ ...base, DEMO_SEEDED: bad })).toThrow(/invalid DEMO_SEEDED/);
     }
+  });
+});
+
+describe("handleDemoLeave: a guest leaves by its own signature", () => {
+  const LATEST = BigInt(Math.floor(NOW / 1000));
+  const lower = (members: readonly Hex[]) => members.map((m) => m.toLowerCase());
+
+  async function leaveChallengeFor(ctx: DemoContext, guest: Identity): Promise<Challenge> {
+    const response = await handleDemoLeaveChallenge(post("leave/challenge", { guest: guest.qor1 }), ctx);
+    expect(response.status).toBe(200);
+    return (await response.json()) as Challenge;
+  }
+
+  function leaveBody(guest: Identity, c: Challenge, signer: Identity = guest) {
+    const signed = signLeave(signer.mldsa.secretKey, { registry: REGISTRY_ADDRESS, boardId: BigInt(c.boardId), guest: guest.evm, botNonce: c.botNonce, expiry: BigInt(c.expiry), latestBlockTimestamp: LATEST });
+    return { guest: guest.evm, botNonce: c.botNonce, expiry: c.expiry, signature: bytesToHex(signed.signature) };
+  }
+
+  const leave = (ctx: DemoContext, body: unknown) => handleDemoLeave(post("leave", body), ctx);
+
+  function removeArgs(send: EvmSend) {
+    const decoded = decodeFunctionData({ abi: boardRegistryAbi, data: send.data });
+    expect(decoded.functionName).toBe("removeMember");
+    const [boardId, member, envelopeHash, envelopeSize, epochAfter] = decoded.args as unknown as readonly [bigint, Hex, Hex, number, bigint];
+    return { boardId, member, envelopeHash, envelopeSize, epochAfter };
+  }
+
+  const withGuests = () => setup({ members: [chair, asha, ben, g1, g2], landSends: true });
+
+  it("issues a leave request that is the spec's bytes, one live per guest, and never the join challenge", async () => {
+    const { ctx, store } = await withGuests();
+    const c = await leaveChallengeFor(ctx, g1);
+    const expected = leaveMessage({ registry: REGISTRY_ADDRESS, boardId: BOARD_ID, guest: g1.evm, botNonce: c.botNonce, expiry: BigInt(c.expiry) });
+    expect(c.message).toBe(bytesToHex(expected));
+    expect(BigInt(c.expiry)).toBe(LATEST + 300n);
+    expect((await leaveChallengeFor(ctx, g1)).botNonce).toBe(c.botNonce);
+    const joinChallenge = await challengeFor(ctx, g1);
+    expect(joinChallenge.botNonce).not.toBe(c.botNonce);
+    expect(joinChallenge.message).not.toBe(c.message);
+    expect(await store.get(leaveKey(g1.account))).not.toBe(await store.get(challengeKey(g1.account)));
+  });
+
+  it("removes exactly the guest who signed, seals the next epoch to everyone else, and the next pack stays shut to the one who left", async () => {
+    const board = await withGuests();
+    const tasks = collector();
+    const ctx = { ...board.ctx, background: tasks.background };
+    const epochBefore = board.state.epoch;
+    const result = await answer(await leave(ctx, leaveBody(g1, await leaveChallengeFor(ctx, g1))));
+    expect(result.status).toBe(202);
+    expect(result.body).toEqual({ txHash: expect.stringMatching(/^0x[0-9a-f]{64}$/), epochAfter: String(epochBefore + 1n) });
+    expect(calls(board.relay.sends)).toEqual(["removeMember"]);
+    const removed = removeArgs(board.relay.sends[0] as EvmSend);
+    expect(removed.member.toLowerCase()).toBe(g1.evm.toLowerCase());
+    expect(removed.epochAfter).toBe(epochBefore + 1n);
+    expect(lower(board.state.members)).toEqual(lower([chair.evm, asha.evm, ben.evm, g2.evm]));
+
+    const grant = board.state.grants[0] as Grant;
+    const envelope = (await board.blobs.read(new URL(`${ORIGIN}/envelope/${grant.envelopeHash.slice(2)}`), grant.envelopeSize)) as Uint8Array;
+    const open = (keys: Member["seal"]) =>
+      openEpochKey({ registry: REGISTRY_ADDRESS, boardRef: board.state.boardRef, epoch: board.state.epoch, envelope, expectedHash: grant.envelopeHash, expectedSize: grant.envelopeSize, sealKeys: keys });
+    expect(() => open(g1.seal)).toThrow();
+    for (const stays of [chair, asha, ben, g2]) expect(open(stays.seal)).toHaveLength(32);
+
+    expect(tasks.scheduled).toHaveLength(1);
+    await (tasks.scheduled[0] as () => Promise<unknown>)();
+    expect(calls(board.relay.sends)).toEqual(["removeMember", "postDocument"]);
+    const posted = postArgs(board.relay.sends[1] as EvmSend);
+    expect(posted.epoch).toBe(epochBefore + 1n);
+    expect(await readPack(board.blobs, board.state.boardRef, grant, g2.seal, posted)).toEqual(PACK);
+    await expect(readPack(board.blobs, board.state.boardRef, grant, g1.seal, posted)).rejects.toThrow();
+  });
+
+  it("keeps the admission used: the guest who left cannot join again", async () => {
+    const board = await withGuests();
+    const ctx = board.ctx;
+    expect(await board.store.get(admittedKey(g1.account))).toBeNull();
+    expect((await answer(await leave(ctx, leaveBody(g1, await leaveChallengeFor(ctx, g1))))).status).toBe(202);
+    expect(await board.store.get(admittedKey(g1.account))).not.toBeNull();
+    const again = await answer(await join(ctx, joinBody(g1, await challengeFor(ctx, g1))));
+    expect(again).toEqual({ status: 409, body: { error: "already_admitted" } });
+    expect(calls(board.relay.sends)).toEqual(["removeMember"]);
+  });
+
+  it("refuses a leave signed by anyone but the guest it names, and changes nothing", async () => {
+    const board = await withGuests();
+    const c = await leaveChallengeFor(board.ctx, g1);
+    for (const signer of [g2, chair, g3]) {
+      expect(await answer(await leave(board.ctx, leaveBody(g1, c, signer)))).toEqual({ status: 403, body: { error: "bad_signature" } });
+    }
+    expect(board.relay.sends).toHaveLength(0);
+    expect(lower(board.state.members)).toContain(g1.evm.toLowerCase());
+    expect(await hourLeft(board.store)).toBe(DEMO_RELAYS_PER_HOUR);
+  });
+
+  it("takes no join signature as a leave and no leave signature as a join", async () => {
+    const board = await withGuests();
+    const c = await leaveChallengeFor(board.ctx, g1);
+    const asJoin = challengeMessage({ registry: REGISTRY_ADDRESS, boardId: BOARD_ID, guest: g1.evm, botNonce: c.botNonce, expiry: BigInt(c.expiry) });
+    const joinSigned = { guest: g1.evm, botNonce: c.botNonce, expiry: c.expiry, signature: bytesToHex(signAction(g1.mldsa.secretKey, asJoin)) };
+    expect(await answer(await leave(board.ctx, joinSigned))).toEqual({ status: 403, body: { error: "bad_signature" } });
+
+    const j = await challengeFor(board.ctx, g3);
+    const leaveSigned = signLeave(g3.mldsa.secretKey, { registry: REGISTRY_ADDRESS, boardId: BOARD_ID, guest: g3.evm, botNonce: j.botNonce, expiry: BigInt(j.expiry), latestBlockTimestamp: LATEST });
+    const asLeave = { guest: g3.evm, botNonce: j.botNonce, expiry: j.expiry, signature: bytesToHex(leaveSigned.signature) };
+    expect(await answer(await join(board.ctx, asLeave))).toEqual({ status: 403, body: { error: "bad_signature" } });
+    expect(board.relay.sends).toHaveLength(0);
+  });
+
+  it("keeps join challenges and leave requests apart: one cannot stand in for the other", async () => {
+    const board = await withGuests();
+    const j = await challengeFor(board.ctx, g1);
+    const withJoinNonce = signLeave(g1.mldsa.secretKey, { registry: REGISTRY_ADDRESS, boardId: BOARD_ID, guest: g1.evm, botNonce: j.botNonce, expiry: BigInt(j.expiry), latestBlockTimestamp: LATEST });
+    const body = { guest: g1.evm, botNonce: j.botNonce, expiry: j.expiry, signature: bytesToHex(withJoinNonce.signature) };
+    expect(await answer(await leave(board.ctx, body))).toEqual({ status: 409, body: { error: "no_challenge" } });
+    expect(board.relay.sends).toHaveLength(0);
+  });
+
+  it("never removes the chair or a seeded director this way, even with their own signature", async () => {
+    const board = await withGuests();
+    for (const who of [asha, chair]) {
+      const refused = await answer(await leave(board.ctx, leaveBody(who, await leaveChallengeFor(board.ctx, who))));
+      expect(refused).toEqual({ status: 403, body: { error: "protected_member" } });
+    }
+    expect(board.relay.sends).toHaveLength(0);
+    expect(board.state.members).toHaveLength(5);
+  });
+
+  it("refuses a valid request from an account that is not on the board, reserving and sending nothing", async () => {
+    const board = await withGuests();
+    const refused = await answer(await leave(board.ctx, leaveBody(g3, await leaveChallengeFor(board.ctx, g3))));
+    expect(refused).toEqual({ status: 409, body: { error: "not_a_member" } });
+    expect(board.relay.sends).toHaveLength(0);
+    expect(await hourLeft(board.store)).toBe(DEMO_RELAYS_PER_HOUR);
+  });
+
+  it("serves one leave request once, even when the store lost the reply of the write that used it up", async () => {
+    const board = await withGuests();
+    const retried = { ...board.ctx, store: retriedWrites(board.store, (write, key) => write !== "setIfAbsent" && key === leaveKey(g1.account)) };
+    const body = leaveBody(g1, await leaveChallengeFor(retried, g1));
+    expect((await answer(await leave(retried, body))).status).toBe(202);
+    expect(await answer(await leave(retried, body))).toEqual({ status: 409, body: { error: "no_challenge" } });
+    expect(calls(board.relay.sends)).toEqual(["removeMember"]);
+  });
+
+  it("removes nobody when the hour has no demo relay left, and says when to come back", async () => {
+    const board = await withGuests();
+    expect(await hourLeft(board.store)).toBe(DEMO_RELAYS_PER_HOUR);
+    const response = await leave(board.ctx, leaveBody(g1, await leaveChallengeFor(board.ctx, g1)));
+    expect(response.headers.get("retry-after")).not.toBeNull();
+    expect(await answer(response)).toEqual({ status: 503, body: { error: "demo_busy" } });
+    expect(board.relay.sends).toHaveLength(0);
+    expect(lower(board.state.members)).toContain(g1.evm.toLowerCase());
+  });
+
+  it("removes nobody while another member's key cannot be read, because the next epoch could not be sealed to it", async () => {
+    const board = await withGuests();
+    board.kemFailures.set(g2.evm.toLowerCase(), "TIMEOUT");
+    const refused = await answer(await leave(board.ctx, leaveBody(g1, await leaveChallengeFor(board.ctx, g1))));
+    expect(refused).toEqual({ status: 503, body: { error: "kem_unavailable" } });
+    expect(board.relay.sends).toHaveLength(0);
+    expect(lower(board.state.members)).toContain(g1.evm.toLowerCase());
+  });
+
+  it("counts leaves per address, refuses a cross-site request before anything, and answers not_ready before the board is seeded", async () => {
+    const board = await withGuests();
+    const tight = { ...board.ctx, limits: { ...ROOMY, leave: { perIp: 2, windowSeconds: 3600 } } };
+    const body = leaveBody(g3, await leaveChallengeFor(tight, g3));
+    expect((await leave(tight, body)).status).toBe(409);
+    expect((await leave(tight, body)).status).toBe(409);
+    expect(await answer(await leave(tight, body))).toEqual({ status: 429, body: { error: "rate_limited" } });
+
+    for (const headers of CROSS_SITE_HEADERS) {
+      for (const handler of [handleDemoLeaveChallenge, handleDemoLeave]) {
+        const request = new Request("http://localhost/api/demo/x", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ guest: g1.evm }) });
+        const response = await handler(request, board.ctx);
+        expect(response.status).toBe(403);
+        expect(request.bodyUsed).toBe(false);
+      }
+    }
+    const unseeded = await setup({ boardId: undefined });
+    expect((await handleDemoLeaveChallenge(post("leave/challenge", { guest: g1.qor1 }), unseeded.ctx)).status).toBe(503);
+    expect((await leave(unseeded.ctx, body)).status).toBe(503);
+    expect(board.relay.sends).toHaveLength(0);
   });
 });

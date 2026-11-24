@@ -106,11 +106,15 @@ export interface BoardSnapshot {
   members: readonly Hex[];
   /** Every grant of the current epoch, in the order the registry appended them. */
   grants: readonly Grant[];
+  /** getBoard's documentCount: how many documents the board holds. */
+  documentCount: number;
+  /** The epoch of the board's latest document, getDocument at documentCount - 1; undefined when it holds none. */
+  latestDocumentEpoch: bigint | undefined;
 }
 
 /** What the demo bot reads from the chain. Every method throws when its read fails, so callers fail closed. */
 export interface DemoChain {
-  /** getBoard, getMembers and the current epoch's getGrants, all at the latest block's number. */
+  /** getBoard, getMembers, the current epoch's getGrants and the latest getDocument, all at the latest block's number. */
   board(boardId: bigint): Promise<BoardSnapshot>;
   /** The account's pqcKeyStatus, all four values. */
   keyStatus(account: Hex): Promise<KeyStatus>;
@@ -192,7 +196,10 @@ export function liveDemoChain(client: PublicClient = evmClient()): DemoChain {
         client.readContract({ ...at, functionName: "getBoard", args: [boardId] }),
         client.readContract({ ...at, functionName: "getMembers", args: [boardId] }),
       ]);
-      const grants = await client.readContract({ ...at, functionName: "getGrants", args: [boardId, board.epoch] });
+      const [grants, latest] = await Promise.all([
+        client.readContract({ ...at, functionName: "getGrants", args: [boardId, board.epoch] }),
+        board.documentCount > 0 ? client.readContract({ ...at, functionName: "getDocument", args: [boardId, BigInt(board.documentCount - 1)] }) : undefined,
+      ]);
       return {
         boardId,
         blockNumber: block.number,
@@ -203,6 +210,8 @@ export function liveDemoChain(client: PublicClient = evmClient()): DemoChain {
         nonce: board.nonce,
         members,
         grants: grants.map((g) => ({ envelopeHash: g.envelopeHash, envelopeSize: g.envelopeSize, mode: g.mode, member: g.member })),
+        documentCount: board.documentCount,
+        latestDocumentEpoch: latest?.epoch,
       };
     },
     keyStatus: (account) => readKeyStatus(client, account),
