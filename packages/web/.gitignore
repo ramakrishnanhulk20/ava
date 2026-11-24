@@ -1,0 +1,8 @@
+node_modules
+.next
+.next-*
+.env.local
+AGENTS.md
+CLAUDE.md
+.source
+next-env.d.ts
