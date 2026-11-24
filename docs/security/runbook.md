@@ -22,6 +22,7 @@ honest caller until its hour ends. That is the residual risk, endpoint by endpoi
 | Document upload token | 30 requests, 12 tokens | 1,500 requests | 50 | Blocks new document uploads. Each token allows exactly the size its request declared (up to 25 MiB), and that size is booked when the token is issued on two daily byte budgets: 25 MiB per client (a /48 gets four times that) and 1,250 MiB in total, fifty times the client figure. Past any of them, the request answers 429 `upload_bytes` and no token is issued, with `retry-after` set to 00:00 UTC. So at most 1,250 MiB of documents can be placed in a UTC day, however they are later posted. Each is deleted two hours after its upload unless a `DocumentPosted` event names its hash, so an attacker's bytes are held for two hours at most. Storage and transfer are billed meanwhile. |
 | Document verify | 30 | 1,500 | 50 | Blocks verifies. Each verify reads at most one unverified blob of up to 25 MiB; a verified one is answered from its mark and never read again. |
 | Demo guest challenge | 10 | 1,000 | 100 | Judges cannot get a challenge, so cannot join, until the hour ends. |
+| Demo leave request | 10 | 1,000 | 100 | Guests cannot get a leave request, so cannot leave by themselves, until the hour ends. Joins are counted apart and go on; a guest still leaves at six hours. |
 | Relay, request whose pre-flight fails | 20 (every request counts) | 3,000 rejected | 150 | Failed pre-flights are answered 429 instead of 422 past the total. Real actions are never blocked by them: an action whose signature the registry accepts is counted per chair, per board and in a separate valid-action total (C40). Each rejected request still costs one call to the public EVM RPC. |
 | Chain REST proxy | 60 a minute | 300 a minute | 5 | Kept low on purpose (C23): every browser shares the server's own quota at the public REST, so a higher total would let one attacker spend that quota for everyone. Five addresses can stop the proxy for a minute at a time. |
 
@@ -134,6 +135,12 @@ or the blob is gone) and `size_mismatch` (it holds one of another size). Neither
   transaction (C40), so the pass is not stuck behind a lost send.
 - A guest challenge can no longer be cancelled by a stranger: only a join that carries a valid
   signature over it consumes it (C43).
+- A guest can take itself off the board with a signed leave (`POST /api/demo/leave`, C47), three
+  tries per IP an hour. It is one removal out of the demo's hourly relays and daily share, like a
+  pass's, and the bot posts the next pack after it. In the logs its `demo_guest_removed` line
+  carries the reason `left`. The chair and the seeded directors are refused. A leave answered
+  503 `demo_busy` means the hour's 120 demo relays are used; it clears when the hour turns. The
+  address stays admitted once, so a guest who left cannot join again.
 
 ### Blob sweeps
 
@@ -188,6 +195,15 @@ or the blob is gone) and `size_mismatch` (it holds one of another size). Neither
   delete the shared-store keys `envsweep:next-block` and `docsweep:marked-through:<registry>` so the sweep
   starts again from the registry's deploy block. The cursor only moves by compare-and-set, so a run
   that finds it changed under it stops with an error and nothing is deleted; run it again.
+
+## The web app on Vercel
+
+The site, its API and the scheduled work are one Next.js deployment (`packages/web`).
+
+- Settings it needs, by name only (`packages/web/.env.example` lists them with a line each): the shared store's URL and token, the blob store's token and public origin, the three role phrases (relayer, sponsor, demo chair), the demo board id and its seeded directors, and `CRON_SECRET`. None of them has a `NEXT_PUBLIC_` name, and none may: a build is checked by searching the browser bundle for the secret names and values.
+- Schedules (`packages/web/vercel.json`): `/api/cron/demo` every 10 minutes (expiry sweep, seat-freeing pass, the pack for the current epoch, and settling admissions whose add never landed), `/api/cron/envelopes` and `/api/cron/documents` every 30 minutes. A cron route answers 401 without the `CRON_SECRET` bearer token, and the gate stays shut if the secret is unset.
+- Client addresses come from the `x-real-ip` header only on Vercel, where the edge sets it. Anywhere else every caller counts as the loopback address, so local runs share one allowance.
+- The demo's pack posts come out of the demo's own daily share (12 QOR). On a record day of joins and seat changes the share can run out before the 120 joins do; the demo then refuses politely until 00:00 UTC and the chairs' share is untouched.
 
 ## Relayer key rotation and clearing a halt
 

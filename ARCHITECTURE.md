@@ -48,7 +48,7 @@ flowchart TB
     ENV["Envelope upload<br/>/api/upload"]
     DOC["Document token and verify<br/>/api/document/..."]
     RELAY["Relay<br/>/api/relay"]
-    DEMO["Demo challenge and join<br/>/api/demo/..."]
+    DEMO["Demo challenge, join and leave<br/>/api/demo/..."]
   end
 
   UP[("Upstash Redis<br/>rate limits, once-only marks,<br/>locks, spend ledger")]
@@ -68,7 +68,7 @@ flowchart TB
   SEAL ==>|"envelope ciphertext only"| ENV
   SEAL -->|"SHA-256 only"| DOC
   SEAL -->|"signed action: public fields and signature"| RELAY
-  SEAL -->|"guest address and signed challenge"| DEMO
+  SEAL -->|"guest address and signed challenge or leave request"| DEMO
   SEAL ==>|"document ciphertext only, one-time token"| BLOB
   BLOB ==>|"ciphertext only, read by hash"| OPEN
   SEAL -.->|"KEM keys, board reads, logs"| RPC
@@ -310,6 +310,7 @@ What each piece holds:
 |---|---|---|
 | `packages/core` | The shared library. Builds the exact signed bytes, decodes every address one way, hashes raw bytes, seals and opens epoch keys, encrypts and decrypts packs, reads ML-KEM keys from the chain. Entry point: `packages/core/src/index.ts` | `actions.ts`, `sign.ts`, `seal.ts`, `kem.ts`, `identity.ts`, `address.ts`, `hash.ts`, `constants.ts` |
 | `packages/server` | The handlers: chain proxy, envelope upload, direct document upload tokens and verification, relay, window keeper, sponsor, demo bot. Entry point: `packages/server/src/index.ts` | `proxy.ts`, `blob.ts`, `docupload.ts`, `relay.ts`, `window.ts`, `sponsor.ts`, `demo.ts`, `demoBoard.ts`, `store.ts`, `ratelimit.ts`, `config.ts` |
+| `packages/web` | The web app, on Next.js: the screens in 6.9, the route handlers that mount `packages/server` under `/api`, and the request proxy that serves every page with its security header. Everything secret happens here, in the browser: the identity vault, signing, sealing, encrypting and the reader ledger | `proxy.ts`, `lib/csp.ts`, `lib/guest/`, `lib/chair/`, `lib/pack/format.ts`, `lib/proof/`, `lib/boardRules.ts`, `content/docs/` |
 | `packages/contracts` | `BoardRegistry` (every board in one immutable contract), `PqcProbe` (the first end-to-end proof of the two precompiles), the interface `IQorePQC`, the Foundry tests and the live proof scripts | `src/BoardRegistry.sol`, `src/PqcProbe.sol`, `src/interfaces/IQorePQC.sol`, `scripts/prove-registry.ts` |
 | `ops/drill` | Scripts for the throwaway account entered in the Q-Day Drill: create it, register its keys, send the drill-day proof transaction, fund other accounts. No other package imports it | `src/status.ts`, `src/register.ts`, `src/proof-tx.ts`, `src/fund.ts` |
 
@@ -514,7 +515,7 @@ Gas ceilings per action, set in `packages/server/src/config.ts`: create 650,000,
 
 ### 6.4 Server endpoints
 
-All are in `packages/server/src`. The routes below are the ones `packages/server/scripts/dev-server.ts` mounts; the app chooses its own mount for the proxy (the dev server uses `/api/chain`). Limits are per client IP as the host reports it, and in total.
+All are in `packages/server/src`. The web app mounts them as Next.js route handlers under `packages/web/app/api/`, at the same paths `packages/server/scripts/dev-server.ts` uses, so one deployment serves the site, its API and the scheduled work. Limits are per client IP as the host reports it, and in total: on Vercel that is the `x-real-ip` header Vercel sets at its edge, and anywhere else it is the loopback address, because a header a caller can set is not an address (`packages/web/lib/server/context.ts`).
 
 #### Chain proxy: GET and POST under `/api/chain`
 
@@ -563,7 +564,7 @@ The token allows one write: exactly that pathname, `application/octet-stream` on
 
 #### Document verify: `POST /api/document/verify`
 
-Request as for the token. The server reads the stored bytes back from the blob origin (at most 26,214,400 bytes, 30 seconds), hashes them, and keeps the blob only if the hash is its name. Response `200` `{ "sha256", "size", "url" }`. The size it read back is stored in the hash's verified mark, and the relay refuses a post whose `cipherSize` differs from it. Run it after every upload and before the chair signs, and post the document soon after. Whether or not it was verified, a document that no `DocumentPosted` event names is deleted two hours after its upload, so a document posted later than that is gone before it can be read. Refusals that delete the blob: 409 with `error` set to `blob_missing`, `too_large`, `empty`, `hash_mismatch` or `too_old` (unverified for over 50 minutes). Refusals that do not: 405, 415, 413, 400, 429, 500, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`, 504 `verify_timeout`. Limits per hour: 30 per IP, 1,500 in total.
+Request `{ "sha256": "<64 lowercase hex>" }` as `application/json`, and nothing else in the body. The server reads the stored bytes back from the blob origin (at most 26,214,400 bytes, 30 seconds), hashes them, and keeps the blob only if the hash is its name. Response `200` `{ "sha256", "size", "url" }`. The size it read back is stored in the hash's verified mark, and the relay refuses a post whose `cipherSize` differs from it. Run it after every upload and before the chair signs, and post the document soon after. Whether or not it was verified, a document that no `DocumentPosted` event names is deleted two hours after its upload, so a document posted later than that is gone before it can be read. Refusals that delete the blob: 409 with `error` set to `blob_missing`, `too_large`, `empty`, `hash_mismatch` or `too_old` (unverified for over 50 minutes). Refusals that do not: 405, 415, 413, 400, 429, 500, 502 `store_failed` or `unexpected_blob_url`, 503 `store_failed`, 504 `verify_timeout`. Limits per hour: 30 per IP, 1,500 in total.
 
 #### Relay: `POST /api/relay`
 
@@ -608,13 +609,26 @@ The pressure pass (`freeDemoSeats`) is the background half. The board keeps six 
 
 Refusals: 405, 503 `not_ready`, 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 409 `no_challenge`, `already_admitted` or `already_member`, 403 `challenge_mismatch`, `challenge_expired`, `no_proven_key`, `bad_signature`, `no_kem_key`, `bad_kem_key` or `key_shared`, 429 `too_many_failures`, 502 `chain_unreachable`, `kem_unavailable`, `envelope_unavailable`, `envelope_mismatch`, `upload_failed`, `upload_mismatch`, `reverted` or `join_failed`, 503 `board_full` (retry-after 30), `admission_unsettled` (retry-after 30), `daily_limit`, `demo_busy`, `store_unavailable`, `busy`, `not_chair`, `chair_not_recipient` or `out_of_time`, 408 `body_timeout`, 403 `cross_site`, and `relay_<code>` when the relay inside refuses (the relay's own code after the prefix).
 
+#### Demo board leave request: `POST /api/demo/leave/challenge`
+
+A guest can leave the demo board, and only by its own signature (threat model C47). Request `{ "guest": "<address>" }`. Response `200` in the shape of the join challenge, where `message` is the 224 bytes of the leave request: `abi.encode(keccak256("ava.leave.v1"), 9800, registry, boardId, guest, botNonce, expiry)`. The guest signs with `signLeave`, which builds those bytes itself. The app rebuilds them from the other fields and refuses an answer whose `message` differs, so a join challenge handed back here is never signed. One live leave request exists per guest for 300 seconds, kept apart from its join challenge. Limits per hour: 10 per IP and 1,000 in total, counted apart from join challenges.
+
+#### Demo board leave: `POST /api/demo/leave`
+
+Request `{ "guest": "<address>", "botNonce": "0x<64 hex>", "expiry": "<decimal>", "signature": "0x<9254 hex>" }`, at most 16,384 bytes. Response `202` `{ "txHash": "0x<64 hex characters>", "epochAfter": "<decimal>" }`, a claim the app confirms on chain: the receipt must show success and carry the registry's `MemberRemoved` for this board and this account.
+
+In order, the bot checks the stored leave request and its expiry, the guest's key from `pqcKeyStatus`, and the signature over the leave bytes it rebuilds from its own record. Only then is the request used up, by compare-and-set, so it serves one leave at most. Under the board's lock the bot reads the board, refuses the chair and the seeded directors (403 `protected_member`) and an account with no seat (409 `not_a_member`), takes one of the hour's demo relays, writes the once-per-address admission mark if it held none, and runs the removal a sweep runs, with the reason `left`: a fresh epoch key sealed to every other usable member, then `removeMember` relayed in the demo's scope. A leave never removes anyone but its signer, and the address stays admitted once: it cannot join again. Afterwards the bot posts the next pack for the new epoch (`ensureCurrentPack`), and the guest who left holds no key for it.
+
+Limit: 3 leaves per IP per hour. Refusals: 403 `cross_site`, 405, 503 `not_ready`, 429 `rate_limited`, 415, 413, 400 `bad_body` or `bad_guest`, 409 `no_challenge` or `not_a_member`, 403 `challenge_mismatch`, `challenge_expired`, `no_proven_key`, `bad_signature` or `protected_member`, 502 `chain_unreachable`, 503 `busy`, `demo_busy`, `kem_unavailable`, `protected_key_unusable`, `store_unavailable` or `leave_failed`. A removal that fails after those answers with the removal's own reason, as a sweep's does.
+
 #### Scheduled work, not HTTP routes
 
-Four functions are exported for a schedule, and nothing deletes anything until the host calls them.
+Four functions are exported for a schedule, and nothing deletes anything until the host calls them. The web app calls them from three routes, `/api/cron/demo` (every 10 minutes), `/api/cron/envelopes` and `/api/cron/documents` (every 30 minutes), listed in `packages/web/vercel.json`. Each answers 401 unless the request carries the deployment's `CRON_SECRET` as a bearer token, which Vercel's scheduler sends.
 
 - `sweepUnreferencedEnvelopes` (`envelopeSweep.ts`) reads the registry's logs from a cursor, marks every envelope hash (`referenced:<registry>:<sha256>`, the registry address in the name) and every posted document hash (`posted:<registry>:<sha256>`, carrying the `cipherSize` the event named), records how far it has read (`docsweep:marked-through:<registry>`), and deletes envelope blobs older than two hours that no event names. Run it about every 30 minutes.
 - `sweepUnverified` (`docupload.ts`) deletes document blobs older than two hours that no `DocumentPosted` event names, and only blobs the scan has read past; it also deletes any non-hash name under `document/` after one hour. A posted blob whose stored size differs from the size its posted mark records is deleted (`document_size_mismatch`). A posted blob that was never verified is hashed once: a match gets its verified mark, a mismatch is deleted (`document_mismatch_deleted`), and one that cannot be read is logged (`document_read_failed`) and kept. It keeps its place in the blob listing between runs (`docsweep:cursor`, moved by compare-and-set) so it reaches every name. A listing the store refuses while a cursor is held resets the cursor to the start. The sweep runs under a lock (`docsweep:lock`, 300 seconds, no waiting), so a second run answers `busy`. It hashes at most 200 MiB a run, starts no new read or page after 240 seconds, and returns `{ deleted, deferred, unreadable, outOfTime }`. Run it after the envelope scan.
 - `sweepDemoGuests` removes at most one demo guest per call, the one admitted longest ago and at least six hours ago, or one whose key is missing, invalid, changed, shared with another member (`key_shared`) or unreadable on three sweeps in a row (`key_unreadable`). Its removal reasons are `expired`, `key_missing`, `key_invalid`, `key_changed`, `key_shared`, `key_unreadable` and `pressure`. The seeded directors and the chair are never removed. It then runs a pressure pass while the board holds more than 34 members, and settles admission marks whose add never landed (an admission mark names its add's transaction; one the chain does not know or knows as reverted, for a guest who is not a member, is released). Run it every few minutes.
+- `ensureCurrentPack` (`demo.ts`) is not a deleter but runs on the same schedule: at the end of every `sweepDemoGuests` run, and in the background after every admitted join, the demo chair posts the demo pack (`demoPack.ts`) for the current epoch if that epoch has none, so every guest has a pack it can open. One post per epoch, through the demo's own budgets.
 - `freeDemoSeats` is the pressure pass described under the join. The join schedules it through the host's `background` runner; also run it on the schedule as a backstop, so a board that fills is freed even if a background run was lost. It removes with the reason `pressure`, or the key reason for a guest with a key problem.
 
 The shared store must run with eviction off, because every keep decision is a mark in it.
@@ -679,9 +693,9 @@ Errors to handle: `HashMismatch`, `EnvelopeError`, `DocumentError`, `ActionError
 
 ### 6.7 Onboarding a new identity
 
-The steps the demo seeding script follows (`onboard` in `packages/server/scripts/seed-demo-board.ts`), which a browser repeats:
+The steps the demo seeding script follows (`onboard` in `packages/server/scripts/seed-demo-board.ts`), which the browser repeats on `/demo` (`packages/web/lib/guest/journey.ts`):
 
-1. Generate the phrase and derive the identity in the browser. Keep it encrypted in browser storage. One key on both lanes: the `qor1` and `0x` forms are the same 20 bytes.
+1. Generate the phrase and derive the identity in the browser. Keep it in browser storage only as a passphrase vault: PBKDF2-SHA-256 at 600,000 rounds, then AES-256-GCM, with a passphrase of 10 characters or more (`packages/web/lib/guest/vault.ts`, threat model C18). The open identity lives in memory for one page view. One key on both lanes: the `qor1` and `0x` forms are the same 20 bytes.
 2. `POST /api/sponsor` with the address. Poll `GET /api/chain/cosmos/bank/v1beta1/balances/{address}` until the balance reaches 250,000 uqor.
 3. Register the ML-DSA-87 key: `MsgRegisterPQCKeyV2` with a proof of possession, signed in classical mode (the chain's first-transaction rule), fee 100,000 uqor for 800,000 gas. Send it with `POST /api/chain/cosmos/tx/v1beta1/txs`, then poll `GET /api/chain/cosmos/tx/v1beta1/txs/{hash}` and `GET /api/chain/qorechain/pqc/v1/account/{address}` until `found` and `possession_proven` are true.
 4. Register the ML-KEM-1024 key: `MsgRegisterKEMKey`, signed in hybrid mode, fee 67,500 uqor for 450,000 gas. Confirm with `qor_getKEMKey`.
@@ -701,13 +715,39 @@ These come from `docs/security/threat-model.md` section C. Each is a promise the
 | Seal a rotation to exactly the members read in the same block as the nonce | C17 |
 | Keep the phrase, secret keys, epoch keys and passphrase inside the browser | C18 |
 | Normalise a pasted recovery phrase with `canonicalPhrase` before any key is derived | C16 |
-| Sign only through `signBoardAction` and `signChallenge`, never bytes a server supplied. Encrypt only under a key opened from an on-chain envelope | C12, C45 |
+| Sign only through `signBoardAction`, `signChallenge` and `signLeave`, never bytes a server supplied. Encrypt only under a key opened from an on-chain envelope | C12, C45, C47 |
+| Say a pack is shut to this browser only after every envelope of its epoch refused the keys held here. A read that fails gives no verdict | C47 |
 | Send `x-ava: 1` on every call to Ava's server | C23 |
+| Serve every page with a Content-Security-Policy built around a nonce made for that response: no inline or evaluated script, no host trusted for scripts, connections only to this origin, the chain's EVM endpoint and the blob store (`proxy.ts`, `lib/csp.ts`) | C19 |
 | Render every chain string and every decrypted document as text. Preview only in a sandboxed frame for types detected from the bytes. Everything else downloads under a cleaned filename | C19, C20 |
 | Label a board from a stranger with its chair and id, and fetch nothing from it until the user opens it | C21 |
 | Treat a relay `txHash` as a claim until the receipt and the action's own event (matched on board id and nonce, never `EnvelopeGranted`) confirm it. To cancel, land another action at that nonce | C26 |
 | Build blob URLs from the on-chain hash and the configured origin, and stop a download at the on-chain size | C30 |
 | The exposure ledger shows "incomplete" rather than a partial list | C38, C39 |
+
+### 6.9 The screens
+
+Every screen reads the chain itself and treats our server as a courier. None of them shows a number that was typed in.
+
+| Route | What it is for | Where its logic lives |
+|---|---|---|
+| `/` | The front page: the seal, the three moves, and the demo board's live reader ledger | `lib/boardHistory.ts`, `lib/boardRules.ts` |
+| `/demo` | A visitor joins the public demo board, opens a pack sealed to them, then leaves and watches the next pack stay shut | `lib/guest/journey.ts`, `lib/guest/leaveJourney.ts`, `lib/guest/shut.ts` |
+| `/board` | Anyone's way in: make, open or restore an identity, put its two keys on chain, list every board the registry's history names it in, create a board | `lib/guest/identity.ts`, `lib/guest/onboard.ts`, `lib/chair/myBoards.ts`, `lib/chair/summary.ts` |
+| `/board/[id]` | One board. A chair posts packs, adds and removes directors. A member or a removed director opens what their keys allow. Everyone sees the reader ledger and can check every key envelope | `lib/chair/room.ts`, `lib/chair/board.ts`, `lib/chair/actions.ts`, `lib/chair/uploads.ts`, `lib/chair/recipients.ts`, `lib/chair/history.ts`, `lib/chair/ledger.ts` |
+| `/proof` | Four attacks on the demo board that the visitor's own browser runs against the chain as the page loads | `lib/proof/specimen.ts`, `lib/proof/run.ts` |
+| `/docs` | The documentation, written as MDX in `content/docs/` and built with the app. `/api/search` serves its search index | `lib/source.ts`, `app/docs/` |
+
+How a chair's change travels from `/board/[id]`:
+
+1. Read the board's record, nonce and members at one block from the public EVM JSON-RPC.
+2. Build the typed action and sign it in the browser (`lib/chair/actions.ts` `signedRelayBody`, which calls `signBoardAction`).
+3. Send it to `/api/relay`. The answer's `txHash` is only a claim.
+4. Wait for the receipt on the public EVM JSON-RPC and find the registry's own event for that board and nonce (`landed`). Only then does the screen say it is done.
+
+A pack's bytes are described in `docs/spec/pack.md`. An identity is brought back on another device from its 24 recovery words (`lib/guest/identity.ts` `restoreGuest`); the keys are derived again, and nothing is fetched from us.
+
+The two pages under `/lab` are design benches for the dev server. They answer 404 anywhere else.
 
 ## 7. Costs
 
@@ -741,7 +781,7 @@ Product limits, from the contract and `packages/core/src/constants.ts`:
 | Envelope size | 110,000 bytes. An envelope to 64 members is 104,545 bytes: 56 bytes of header, plus 1,632 bytes per recipient, plus a 41-byte payload (56 + 1,632 x 64 + 41). The contract's own NatSpec says 104,568 (a 64-byte payload); the deployed source is left as it was built |
 | Pack (document ciphertext) size | 26,214,400 bytes (25 MiB) |
 | Signature deadline | At most 3,600 seconds after the latest block |
-| Signature size | 4,627 bytes. Message size 256 bytes. Challenge size 224 bytes |
+| Signature size | 4,627 bytes. Message size 256 bytes. Challenge and leave request size 224 bytes |
 | Stored on chain per pack | The hash, size, epoch and time. No URI, no name, no content |
 
 Hosting limits:
